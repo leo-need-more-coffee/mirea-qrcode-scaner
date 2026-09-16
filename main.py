@@ -455,7 +455,7 @@ class App:
             self.scanning = False
             self.post("scan", False)
             return
-        current_token = ""
+        confirmed_tokens: set[str] = set()
         qr_successes = 0
         presence_pending = False
         while self.scanning and not self.stop.is_set():
@@ -474,30 +474,34 @@ class App:
                     self.post("status", "Присутствие в онлайн-мероприятии подтверждено")
 
                 if time.time() - self.last_success >= int(self.settings["cooldown_minutes"]) * 60:
+                    if self.last_success:
+                        self.last_success = 0.0
+                        confirmed_tokens.clear()
+                        qr_successes = 0
                     codes = zxingcpp.read_barcodes(screenshot)
                     token = None
                     for code in codes:
                         token = qr_token(code.text)
                         if token:
                             break
-                    if token:
-                        if token != current_token:
-                            current_token = token
-                            qr_successes = 0
+                    if token and token not in confirmed_tokens:
                         attempt = qr_successes + 1
-                        self.log("SCAN", f"Найден QR Pulse. Попытка {attempt}/3")
-                        self.post("status", f"Найден QR — попытка {attempt}/3…")
+                        self.log("SCAN", f"Найден новый QR Pulse. Подтверждение {attempt}/3")
+                        self.post("status", f"Найден новый QR — подтверждение {attempt}/3…")
                         ok, detail = self.approve(token)
                         if ok:
+                            confirmed_tokens.add(token)
                             qr_successes += 1
                             if qr_successes == 3:
                                 self.last_success = time.time()
-                                self.log("PULSE", "Посещение подтверждено: 3/3. Включена пауза QR")
+                                self.log("PULSE", "Три разных QR подтверждены: 3/3. Включена пауза QR")
                                 self.post("status", "Посещение подтверждено: 3/3")
                             else:
-                                self.log("PULSE", f"Посещение подтверждено: {qr_successes}/3")
+                                self.log("PULSE", f"Новый QR подтверждён: {qr_successes}/3")
                                 self.post("status", f"Посещение подтверждено: {qr_successes}/3")
                         else:
+                            confirmed_tokens.clear()
+                            qr_successes = 0
                             self.log("PULSE", "Подтверждение отклонено: " + detail)
                             self.post("status", "Ошибка Pulse: " + detail)
                 elif not presence_activity:
