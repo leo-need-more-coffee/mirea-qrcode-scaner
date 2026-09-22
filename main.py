@@ -374,6 +374,8 @@ class App:
         self.lecture = False
         self.bot_running = False
         self.bot_thread: threading.Thread | None = None
+        self.code_answer: queue.Queue | None = None
+        self.code_window = None
         self.pair_code = ""
         self.browser_busy = False
         self.account = ""
@@ -507,10 +509,12 @@ class App:
         self.scan_button = self.button(controls, text="Начать сканирование", command=self.toggle_scan)
         self.scan_button.pack(side="left")
         lecture_row = tk.Frame(state, bg=self.CARD)
-        lecture_row.pack(anchor="w", pady=(8, 0))
+        lecture_row.pack(fill="x", pady=(10, 0))
         self.lecture_button = self.button(lecture_row, text="Открыть лекцию", style="Secondary.TButton", command=self.toggle_lecture)
         self.lecture_button.pack(side="left")
-        self.label(lecture_row, "СДО и Pulse в одном окне", 9, color=self.MUTED).pack(side="left", padx=10)
+        self.lecture_link = tk.StringVar(value=self.settings.get("lecture_url", ""))
+        self.entry(lecture_row, textvariable=self.lecture_link).pack(side="left", fill="x", expand=True, padx=8)
+        self.label(state, "Ссылка на занятие открывается вкладкой рядом с Pulse и СДО", 9, color=self.MUTED).pack(anchor="w", pady=(4, 0))
         logs = self.card(self.main_page)
         logs.pack(fill="both", expand=True)
         self.label(logs, "Журнал работы", 11, True).pack(anchor="w")
@@ -557,38 +561,6 @@ class App:
         self.entry(row, width=8, textvariable=self.cooldown).pack(side="left")
         self.label(row, "минут").pack(side="left", padx=8)
         self.button(row, text="Сохранить", command=self.save_cooldown).pack(side="left")
-        lecture = self.card(self.settings_body)
-        lecture.pack(fill="x", pady=(0, 10))
-        self.label(lecture, "Ссылка на занятие", 11, True).pack(anchor="w")
-        self.label(lecture, "Откроется вкладкой рядом с Pulse: QR и кнопка присутствия ищутся прямо в ней,\nпоэтому снимки экрана не нужны.", 9, color=self.MUTED, justify="left").pack(anchor="w", pady=(6, 5))
-        lecture_row = tk.Frame(lecture, bg=self.CARD)
-        lecture_row.pack(anchor="w", fill="x")
-        self.lecture_link = tk.StringVar(value=self.settings.get("lecture_url", ""))
-        self.entry(lecture_row, textvariable=self.lecture_link).pack(side="left", fill="x", expand=True)
-        self.button(lecture_row, text="Сохранить", command=self.save_lecture_link).pack(side="left", padx=8)
-        support = self.card(self.settings_body)
-        support.pack(fill="x", pady=(0, 10))
-        self.label(support, "Поддержка", 11, True).pack(anchor="w")
-        support_row = tk.Frame(support, bg=self.CARD)
-        support_row.pack(fill="x", pady=(6, 0))
-        left = tk.Frame(support_row, bg=self.CARD)
-        left.pack(side="left", fill="x", expand=True)
-        self.label(left, "Поддержите автора: подключите FOTUR VPN (Работаем через Hiddify)\nили поддержите используя QR.", 9, color=self.MUTED, justify="left").pack(anchor="w")
-        buttons = tk.Frame(left, bg=self.CARD)
-        buttons.pack(anchor="w", pady=(8, 0))
-        self.button(buttons, text="Открыть @foturvpnbot", command=lambda: webbrowser.open("https://t.me/foturvpnbot")).pack(side="left")
-        self.button(buttons, text="Поддержать донатом", style="Secondary.TButton", command=lambda: webbrowser.open(CLOUDTIPS_URL)).pack(side="left", padx=8)
-        if QR_IMAGE.exists():
-            try:
-                from PIL import Image, ImageTk
-                with Image.open(QR_IMAGE) as image:
-                    image.thumbnail((110, 110))
-                    self.donation_qr = ImageTk.PhotoImage(image.copy())
-                qr = tk.Label(support_row, image=self.donation_qr, bg=self.CARD, cursor="hand2")
-                qr.pack(side="right", padx=(10, 0))
-                qr.bind("<Button-1>", lambda _event: webbrowser.open(CLOUDTIPS_URL))
-            except (tk.TclError, ImportError):
-                LOGGER.exception("Donation QR cannot be loaded")
         profile = self.card(self.settings_body)
         profile.pack(fill="x")
         self.label(profile, "Аккаунты Pulse", 11, True).pack(anchor="w")
@@ -842,6 +814,11 @@ class App:
 
     def bot_command(self, text: str) -> str:
         """Выполняет команду чата и возвращает ответ"""
+        waiting = self.code_answer
+        if waiting is not None and not text.startswith("/"):
+            if waiting.empty():
+                waiting.put(text)
+            return "Код принят"
         command = text.split()[0].lower().split("@")[0]
         if command == "/status":
             logged = [item["title"] for item in self.settings["accounts"] if item["name"]]
@@ -1006,16 +983,6 @@ class App:
         self.log("SETTINGS", f"Пауза после успеха: {minutes} мин.")
         self.post("status", "Настройки сохранены")
 
-    def save_lecture_link(self) -> None:
-        link = self.lecture_link.get().strip()
-        if link and not link.startswith(("http://", "https://")):
-            messagebox.showerror(APP_NAME, "Ссылка должна начинаться с http:// или https://")
-            return
-        self.settings["lecture_url"] = link
-        self.save_settings()
-        self.log("LECTURE", "Ссылка занятия сохранена" if link else "Ссылка занятия очищена")
-        self.post("status", "Настройки сохранены")
-
     def copy_profile(self) -> None:
         self.root.clipboard_clear()
         self.root.clipboard_append(str(profile_path(self.settings["current"])))
@@ -1096,29 +1063,74 @@ class App:
                 continue
         return None
 
-    def ask_code(self, title: str) -> str:
-        """Спрашивает код 2FA в главном потоке и ждёт ответа"""
-        answer: queue.Queue[str | None] = queue.Queue(maxsize=1)
-        self.root.after(0, lambda: answer.put(simpledialog.askstring(APP_NAME, f"Код двухфакторной проверки для «{title}»", parent=self.root)))
-        try:
-            return (answer.get(timeout=300) or "").strip()
-        except queue.Empty:
-            return ""
+    def code_dialog(self, title: str, answer: queue.Queue) -> None:
+        """Окно ввода кода, которое закрывается само, если код пришёл из Telegram"""
+        window = tk.Toplevel(self.root)
+        window.title(APP_NAME)
+        window.configure(bg=self.BG, padx=18, pady=14)
+        window.transient(self.root)
+        self.code_window = window
+        tk.Label(window, text=f"Код двухфакторной проверки для «{title}»", bg=self.BG, fg=self.TEXT,
+                 font=(self.font, 10)).pack(anchor="w")
+        tk.Label(window, text="Код можно прислать и боту в Telegram", bg=self.BG, fg=self.MUTED,
+                 font=(self.font, 9)).pack(anchor="w", pady=(2, 8))
+        field = ttk.Entry(window, width=24, font=(self.font, 11))
+        field.pack(anchor="w")
+        field.focus_set()
+        row = tk.Frame(window, bg=self.BG)
+        row.pack(anchor="w", pady=(10, 0))
 
-    def autologin(self, page, account: dict) -> None:
-        """Заполняет форму входа сохранёнными данными, код 2FA спрашивает у пользователя"""
+        def accept(_event=None) -> None:
+            if answer.empty():
+                answer.put(field.get())
+
+        field.bind("<Return>", accept)
+        ttk.Button(row, text="Отправить", command=accept).pack(side="left")
+        ttk.Button(row, text="Отмена", style="Secondary.TButton",
+                   command=lambda: answer.empty() and answer.put("")).pack(side="left", padx=8)
+        window.protocol("WM_DELETE_WINDOW", lambda: answer.empty() and answer.put(""))
+
+    def close_code_dialog(self) -> None:
+        window, self.code_window = self.code_window, None
+        if window:
+            try:
+                window.destroy()
+            except tk.TclError:
+                pass
+
+    def ask_code(self, title: str) -> str:
+        """Ждёт код 2FA из окна приложения или из чата Telegram — что придёт первым"""
+        answer: queue.Queue[str] = queue.Queue(maxsize=1)
+        self.code_answer = answer
+        self.notify(f"Нужен код двухфакторной проверки для «{title}». Отправьте код сообщением.")
+        self.root.after(0, lambda: self.code_dialog(title, answer))
+        try:
+            code = answer.get(timeout=300)
+        except queue.Empty:
+            code = ""
+        self.code_answer = None
+        self.root.after(0, self.close_code_dialog)
+        return code.strip()
+
+    def autologin(self, page, account: dict, attempts: int = 20, quiet: bool = False) -> None:
+        """Заполняет форму входа сохранёнными данными, код 2FA спрашивает у пользователя
+
+        Pulse и СДО пользуются одним входом, поэтому метод подходит обеим вкладкам.
+        Для вкладки с готовой сессией формы не будет — тогда quiet отключает сообщение.
+        """
         login = account.get("login", "")
         password = load_password(account["id"]) if login else ""
         if not login or not password:
             return
-        for _ in range(20):
+        for _ in range(attempts):
             login_field, password_field = self.login_fields(page)
             if password_field:
                 break
             if self.stop.wait(1):
                 return
         else:
-            self.log("AUTH", f"{account['title']}: форма входа не найдена, войдите вручную")
+            if not quiet:
+                self.log("AUTH", f"{account['title']}: форма входа не найдена, войдите вручную")
             return
         try:
             if login_field:
@@ -1217,6 +1229,13 @@ class App:
         if self.browser_busy:
             self.post("status", "Уже выполняется проверка или вход…")
             return
+        link = self.lecture_link.get().strip()
+        if link and not link.startswith(("http://", "https://")):
+            messagebox.showerror(APP_NAME, "Ссылка должна начинаться с http:// или https://")
+            return
+        if link != self.settings.get("lecture_url"):
+            self.settings["lecture_url"] = link
+            self.save_settings()
         self.lecture = True
         self.browser_busy = True
         self.post("lecture", True)
@@ -1295,6 +1314,7 @@ class App:
                 pulse.goto(PULSE_HOME, wait_until="domcontentloaded", timeout=60000)
                 lecture = ctx.new_page()
                 lecture.goto(EDU_HOME, wait_until="domcontentloaded", timeout=60000)
+                self.autologin(lecture, current, attempts=8, quiet=True)
                 self.log("LECTURE", "Открыты вкладки СДО и Pulse. Войдите и запустите лекцию в этом окне")
                 link = self.settings.get("lecture_url", "").strip()
                 if link:
