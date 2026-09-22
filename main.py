@@ -31,6 +31,7 @@ PULSE_HOME = "https://pulse.mirea.ru/"
 EDU_HOME = "https://online-edu.mirea.ru/"
 PRESENCE_TEXT = re.compile(r"подтверждаю", re.IGNORECASE)
 ENTRY_TEXT = re.compile(r"войти|вход|sign in|log in", re.IGNORECASE)
+SKIP_TEXT = re.compile(r"пропустить|позже|не сейчас|skip|later", re.IGNORECASE)
 PULSE_RPC = "https://pulse.mirea.ru/rtu_tc.attendance.api.AttendanceService/SelfApproveAttendanceThroughQRCode"
 CLOUDTIPS_URL = "https://pay.cloudtips.ru/p/b58c4bc1"
 
@@ -1064,9 +1065,17 @@ class App:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             page.goto(PULSE_HOME, wait_until="domcontentloaded", timeout=60000)
             self.autologin(page, account)
+            skips = 0
             for _ in range(90):
                 if self.stop.wait(1):
                     break
+                if skips < 3:
+                    skip = self.skip_button(page)
+                    if skip is not None and self.press(skip):
+                        skips += 1
+                        self.log("AUTH", f"{account['title']}: пропускаю необязательный шаг входа")
+                        self.stop.wait(3)
+                        continue
                 try:
                     state = page.evaluate(STATE_JS)
                 except PlaywrightError:
@@ -1127,6 +1136,21 @@ class App:
                         return locator.first
                 except PlaywrightError:
                     continue
+        return None
+
+    @staticmethod
+    def skip_button(page):
+        """Кнопка пропуска необязательного шага входа, например настройки аккаунта в Keycloak"""
+        for frame in page.frames:
+            try:
+                named = frame.locator("input[name=skip]:visible, button[name=skip]:visible")
+                if named.count():
+                    return named.first
+                for locator in (frame.get_by_role("button", name=SKIP_TEXT), frame.get_by_role("link", name=SKIP_TEXT)):
+                    if locator.count() and locator.first.is_visible():
+                        return locator.first
+            except PlaywrightError:
+                continue
         return None
 
     @staticmethod
