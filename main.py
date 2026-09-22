@@ -105,13 +105,61 @@ def logger() -> logging.Logger:
 LOGGER = logger()
 
 
+KEYRING_SERVICE = "Shalost FOTUR"
+
+
+def keyring_module():
+    """Системное хранилище паролей, если оно доступно в этой системе"""
+    try:
+        import keyring
+        if keyring.get_keyring().priority <= 0:
+            return None
+        return keyring
+    except Exception:
+        LOGGER.exception("Keyring is unavailable")
+        return None
+
+
+def save_password(account_id: str, password: str) -> bool:
+    store = keyring_module()
+    if not store:
+        return False
+    try:
+        store.set_password(KEYRING_SERVICE, account_id, password)
+        return True
+    except Exception:
+        LOGGER.exception("Password cannot be saved")
+        return False
+
+
+def load_password(account_id: str) -> str:
+    store = keyring_module()
+    if not store:
+        return ""
+    try:
+        return store.get_password(KEYRING_SERVICE, account_id) or ""
+    except Exception:
+        LOGGER.exception("Password cannot be read")
+        return ""
+
+
+def forget_password(account_id: str) -> None:
+    store = keyring_module()
+    if not store:
+        return
+    try:
+        store.delete_password(KEYRING_SERVICE, account_id)
+    except Exception:
+        LOGGER.info("Stored password not found for %s", account_id)
+
+
 def profile_path(account_id: str) -> Path:
     """Папка Chrome для отдельного аккаунта Pulse"""
     return ACCOUNTS_DIR / account_id / "pulse-chrome-profile"
 
 
 def new_account(title: str) -> dict:
-    return {"id": uuid4().hex[:12], "title": title, "enabled": True, "name": ""}
+    return {"id": uuid4().hex[:12], "title": title, "enabled": True, "name": "", "login": ""}
 
 
 def load_settings() -> dict:
@@ -128,6 +176,7 @@ def load_settings() -> dict:
         account.setdefault("title", "Аккаунт")
         account.setdefault("enabled", True)
         account.setdefault("name", "")
+        account.setdefault("login", "")
     data["accounts"] = accounts
     if data.get("current") not in [account["id"] for account in accounts]:
         data["current"] = accounts[0]["id"]
@@ -320,6 +369,8 @@ class App:
         self.root.update_idletasks()
         self.enable_rounded_window()
         self.log("UI", "Интерфейс готов.")
+        store = keyring_module()
+        LOGGER.info("Keyring backend: %s", store.get_keyring() if store else "недоступно")
         self.root.after(150, self.pump)
         self.root.after(1000, self.check_session)
 
@@ -577,16 +628,24 @@ class App:
                         command=lambda item=account: self.remove_account(item)).pack(side="right")
             self.button(row, text="Выйти", style="Secondary.TButton",
                         command=lambda item=account: self.logout(item)).pack(side="right", padx=8)
+            self.button(row, text="Пароль", style="Secondary.TButton",
+                        command=lambda item=account: self.edit_credentials(item)).pack(side="right")
             enabled = tk.BooleanVar(value=bool(account["enabled"]))
             tk.Checkbutton(row, text="QR", variable=enabled, bg=self.CARD, fg=self.MUTED,
                            selectcolor=self.FIELD, activebackground=self.CARD, activeforeground=self.MUTED,
                            highlightthickness=0, font=(self.font, 9),
                            command=lambda item=account, flag=enabled: self.toggle_account(item, flag)).pack(side="right", padx=8)
-            title = account["title"] + " · " + (account["name"] or "нет входа")
-            tk.Radiobutton(row, text=title, variable=self.current_choice, value=account["id"],
+            tk.Radiobutton(row, text=account["title"], variable=self.current_choice, value=account["id"],
                            command=self.select_account, bg=self.CARD, fg=self.TEXT, selectcolor=self.FIELD,
                            activebackground=self.CARD, activeforeground=self.TEXT, highlightthickness=0,
                            anchor="w", font=(self.font, 10, "bold")).pack(side="left", fill="x", expand=True)
+            if account["name"]:
+                status = "вход выполнен: " + account["name"]
+            elif account.get("login"):
+                status = "автовход настроен, войдите для проверки"
+            else:
+                status = "вход не выполнен"
+            self.label(self.accounts_box, status, 9, color=self.MUTED).pack(anchor="w", padx=(26, 0), pady=(0, 6))
 
     def select_account(self) -> None:
         self.settings["current"] = self.current_choice.get()
@@ -600,6 +659,35 @@ class App:
         self.save_settings()
         self.post("accounts", None)
         self.log("ACCOUNT", f"{account['title']}: {'участвует' if account['enabled'] else 'не участвует'} в подтверждении")
+
+    def edit_credentials(self, account: dict) -> None:
+        """Сохраняет логин и пароль аккаунта в системном хранилище"""
+        if not keyring_module():
+            messagebox.showinfo(APP_NAME, "Системное хранилище паролей недоступно.\n"
+                                          "В Linux нужен KWallet или GNOME Keyring, иначе входите вручную.")
+            return
+        login = simpledialog.askstring(APP_NAME, f"Логин для «{account['title']}»",
+                                       initialvalue=account.get("login", ""), parent=self.root)
+        if login is None:
+            return
+        login = login.strip()
+        if not login:
+            account["login"] = ""
+            forget_password(account["id"])
+            self.save_settings()
+            self.post("accounts", None)
+            self.log("AUTH", f"{account['title']}: сохранённые данные входа удалены")
+            return
+        password = simpledialog.askstring(APP_NAME, f"Пароль для «{account['title']}»", show="*", parent=self.root)
+        if password is None:
+            return
+        if not save_password(account["id"], password):
+            messagebox.showerror(APP_NAME, "Не удалось сохранить пароль в системном хранилище")
+            return
+        account["login"] = login
+        self.save_settings()
+        self.post("accounts", None)
+        self.log("AUTH", f"{account['title']}: данные входа сохранены, пароль лежит в системном хранилище")
 
     def add_account(self) -> None:
         title = simpledialog.askstring(APP_NAME, "Название аккаунта", parent=self.root)
@@ -623,6 +711,7 @@ class App:
         if not messagebox.askyesno(APP_NAME, f"Удалить аккаунт «{account['title']}» вместе с его сессией?"):
             return
         shutil.rmtree(profile_path(account["id"]).parent, ignore_errors=True)
+        forget_password(account["id"])
         self.settings["accounts"].remove(account)
         if self.settings["current"] == account["id"]:
             self.settings["current"] = self.settings["accounts"][0]["id"]
@@ -696,6 +785,86 @@ class App:
         self.log("AUTH", f"{self.current_account()['title']}: открыто официальное окно Pulse для входа")
         threading.Thread(target=self.login_worker, daemon=True).start()
 
+    @staticmethod
+    def login_fields(page):
+        """Поля логина и пароля в любом кадре страницы входа"""
+        for frame in page.frames:
+            try:
+                password = frame.locator("input[type=password]:visible")
+                if not password.count():
+                    continue
+                login = frame.locator("input[type=text]:visible, input[type=email]:visible, input[type=tel]:visible")
+                return login.first if login.count() else None, password.first
+            except PlaywrightError:
+                continue
+        return None, None
+
+    @staticmethod
+    def code_field(page):
+        """Поле одноразового кода двухфакторной проверки"""
+        selector = ("input[autocomplete='one-time-code']:visible, input[name*='otp' i]:visible, "
+                    "input[name*='code' i]:visible, input[id*='otp' i]:visible, input[id*='code' i]:visible")
+        for frame in page.frames:
+            try:
+                field = frame.locator(selector)
+                if field.count():
+                    return field.first
+            except PlaywrightError:
+                continue
+        return None
+
+    def ask_code(self, title: str) -> str:
+        """Спрашивает код 2FA в главном потоке и ждёт ответа"""
+        answer: queue.Queue[str | None] = queue.Queue(maxsize=1)
+        self.root.after(0, lambda: answer.put(simpledialog.askstring(APP_NAME, f"Код двухфакторной проверки для «{title}»", parent=self.root)))
+        try:
+            return (answer.get(timeout=300) or "").strip()
+        except queue.Empty:
+            return ""
+
+    def autologin(self, page, account: dict) -> None:
+        """Заполняет форму входа сохранёнными данными, код 2FA спрашивает у пользователя"""
+        login = account.get("login", "")
+        password = load_password(account["id"]) if login else ""
+        if not login or not password:
+            return
+        for _ in range(20):
+            login_field, password_field = self.login_fields(page)
+            if password_field:
+                break
+            if self.stop.wait(1):
+                return
+        else:
+            self.log("AUTH", f"{account['title']}: форма входа не найдена, войдите вручную")
+            return
+        try:
+            if login_field:
+                login_field.fill(login)
+            password_field.fill(password)
+            password_field.press("Enter")
+            self.log("AUTH", f"{account['title']}: данные входа отправлены")
+        except PlaywrightError as exc:
+            self.log("AUTH", f"{account['title']}: не удалось заполнить форму — " + self.short(exc))
+            return
+        for _ in range(20):
+            if self.stop.wait(1):
+                return
+            field = self.code_field(page)
+            if not field:
+                continue
+            self.post("status", "Введите код двухфакторной проверки")
+            code = self.ask_code(account["title"])
+            if not code:
+                self.log("AUTH", f"{account['title']}: код не введён, завершите вход в окне Chrome")
+                return
+            try:
+                field.fill(code)
+                field.press("Enter")
+                self.log("AUTH", f"{account['title']}: код двухфакторной проверки отправлен")
+            except PlaywrightError as exc:
+                self.log("AUTH", f"{account['title']}: не удалось отправить код — " + self.short(exc))
+            return
+
     def login_worker(self) -> None:
         try:
             with sync_playwright() as p:
@@ -703,6 +872,7 @@ class App:
                 ctx = launch_context(p, headless=False, profile=profile_path(account["id"]))
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 page.goto(PULSE_HOME, wait_until="domcontentloaded", timeout=60000)
+                self.autologin(page, account)
                 for _ in range(600):
                     if self.stop.wait(1):
                         break

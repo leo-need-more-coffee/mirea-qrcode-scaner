@@ -1,4 +1,5 @@
 playwright==1.56.0
 zxing-cpp==2.3.0
 Pillow==10.4.0
+keyring==25.7.0
 mss==10.2.0 ; sys_platform == "linux"
