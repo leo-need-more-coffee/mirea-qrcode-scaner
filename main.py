@@ -17,7 +17,6 @@ import time
 import urllib.error
 import urllib.request
 import tkinter as tk
-import webbrowser
 from pathlib import Path
 from tkinter import font as tkfont, messagebox, simpledialog, ttk
 from urllib.parse import parse_qs, unquote, unquote_plus, urlparse
@@ -31,7 +30,6 @@ PULSE_HOME = "https://pulse.mirea.ru/"
 EDU_HOME = "https://online-edu.mirea.ru/"
 PRESENCE_TEXT = re.compile(r"подтверждаю", re.IGNORECASE)
 PULSE_RPC = "https://pulse.mirea.ru/rtu_tc.attendance.api.AttendanceService/SelfApproveAttendanceThroughQRCode"
-CLOUDTIPS_URL = "https://pay.cloudtips.ru/p/b58c4bc1"
 
 
 def data_dir() -> Path:
@@ -49,7 +47,6 @@ ACCOUNTS_DIR = DATA_DIR / "accounts"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 RUN_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", RUN_DIR))
-QR_IMAGE = BUNDLE_DIR / "assets" / "cloudtips-donation-qr.png"
 APP_ICON = BUNDLE_DIR / "assets" / "shalost-fotur.ico"
 APP_ICON_PNG = BUNDLE_DIR / "assets" / "shalost-fotur.png"
 
@@ -473,18 +470,7 @@ class App:
         self.settings_body = self.scrollable(self.settings_page)
         self.build_main()
         self.build_settings()
-        footer = tk.Frame(outer, bg=self.BG)
-        footer.pack(fill="x", pady=(8, 0))
-        tk.Label(footer, text="Сделано ", bg=self.BG, fg="#9db1ce", font=(self.font, 9)).pack(side="left")
-        self.link(footer, "FOTUR", "https://fotur.tech").pack(side="left")
-        tk.Label(footer, text=" для студентов by ", bg=self.BG, fg="#9db1ce", font=(self.font, 9)).pack(side="left")
-        self.link(footer, "@Woonze", "https://github.com/Woonze").pack(side="left")
         self.show_main()
-
-    def link(self, parent, text, url):
-        item = tk.Label(parent, text=text, bg=parent.cget("bg"), fg="#77adff", cursor="hand2", font=(self.font, 9, "underline"))
-        item.bind("<Button-1>", lambda _event: webbrowser.open(url))
-        return item
 
     def build_main(self) -> None:
         state = self.card(self.main_page)
@@ -562,29 +548,6 @@ class App:
         self.lecture_link = tk.StringVar(value=self.settings.get("lecture_url", ""))
         self.entry(lecture_row, textvariable=self.lecture_link).pack(side="left", fill="x", expand=True)
         self.button(lecture_row, text="Сохранить", command=self.save_lecture_link).pack(side="left", padx=8)
-        support = self.card(self.settings_body)
-        support.pack(fill="x", pady=(0, 10))
-        self.label(support, "Поддержка", 11, True).pack(anchor="w")
-        support_row = tk.Frame(support, bg=self.CARD)
-        support_row.pack(fill="x", pady=(6, 0))
-        left = tk.Frame(support_row, bg=self.CARD)
-        left.pack(side="left", fill="x", expand=True)
-        self.label(left, "Поддержите автора: подключите FOTUR VPN (Работаем через Hiddify)\nили поддержите используя QR.", 9, color=self.MUTED, justify="left").pack(anchor="w")
-        buttons = tk.Frame(left, bg=self.CARD)
-        buttons.pack(anchor="w", pady=(8, 0))
-        self.button(buttons, text="Открыть @foturvpnbot", command=lambda: webbrowser.open("https://t.me/foturvpnbot")).pack(side="left")
-        self.button(buttons, text="Поддержать донатом", style="Secondary.TButton", command=lambda: webbrowser.open(CLOUDTIPS_URL)).pack(side="left", padx=8)
-        if QR_IMAGE.exists():
-            try:
-                from PIL import Image, ImageTk
-                with Image.open(QR_IMAGE) as image:
-                    image.thumbnail((110, 110))
-                    self.donation_qr = ImageTk.PhotoImage(image.copy())
-                qr = tk.Label(support_row, image=self.donation_qr, bg=self.CARD, cursor="hand2")
-                qr.pack(side="right", padx=(10, 0))
-                qr.bind("<Button-1>", lambda _event: webbrowser.open(CLOUDTIPS_URL))
-            except (tk.TclError, ImportError):
-                LOGGER.exception("Donation QR cannot be loaded")
         profile = self.card(self.settings_body)
         profile.pack(fill="x")
         self.label(profile, "Аккаунты Pulse", 11, True).pack(anchor="w")

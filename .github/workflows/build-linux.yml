@@ -25,7 +25,6 @@ jobs:
         run: >
           pyinstaller --noconfirm --clean --onedir --exclude-module numpy
           --hidden-import PIL._tkinter_finder
-          --add-data "assets/cloudtips-donation-qr.png:assets"
           --add-data "assets/shalost-fotur.ico:assets"
           --add-data "assets/shalost-fotur.png:assets"
           --name Shalost-FOTUR main.py
