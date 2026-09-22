@@ -30,6 +30,7 @@ APP_NAME = "Shalost FOTUR"
 PULSE_HOME = "https://pulse.mirea.ru/"
 EDU_HOME = "https://online-edu.mirea.ru/"
 PRESENCE_TEXT = re.compile(r"подтверждаю", re.IGNORECASE)
+ENTRY_TEXT = re.compile(r"войти|вход|sign in|log in", re.IGNORECASE)
 PULSE_RPC = "https://pulse.mirea.ru/rtu_tc.attendance.api.AttendanceService/SelfApproveAttendanceThroughQRCode"
 CLOUDTIPS_URL = "https://pay.cloudtips.ru/p/b58c4bc1"
 
@@ -1115,16 +1116,37 @@ class App:
         return login_field, password_field
 
     @staticmethod
+    def entry_button(page):
+        """Кнопка или ссылка входа на странице, где формы ещё нет"""
+        for frame in page.frames:
+            for locator in (frame.get_by_role("button", name=ENTRY_TEXT),
+                            frame.get_by_role("link", name=ENTRY_TEXT),
+                            frame.get_by_text(ENTRY_TEXT)):
+                try:
+                    if locator.count() and locator.first.is_visible():
+                        return locator.first
+                except PlaywrightError:
+                    continue
+        return None
+
+    @staticmethod
     def page_summary(page) -> str:
-        """Куда попала страница и какие поля на ней видны — без значений"""
+        """Куда попала страница, какие поля и кнопки на ней видны — без значений"""
         try:
-            fields = page.evaluate("""() => [...document.querySelectorAll('input')]
-                .filter(item => item.offsetParent !== null)
-                .map(item => (item.type || 'text') + (item.name ? ':' + item.name : ''))
-                .slice(0, 8)""")
+            summary = page.evaluate(r"""() => {
+                const visible = item => item.offsetParent !== null;
+                const fields = [...document.querySelectorAll('input')].filter(visible)
+                    .map(item => (item.type || 'text') + (item.name ? ':' + item.name : '')).slice(0, 8);
+                const buttons = [...document.querySelectorAll('button, a, [role=button]')].filter(visible)
+                    .map(item => (item.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 24))
+                    .filter(Boolean).slice(0, 8);
+                return {fields, buttons};
+            }""")
         except PlaywrightError:
-            fields = []
-        return f"{page.url} · поля: {', '.join(fields) or 'нет'}"
+            summary = {}
+        fields = ", ".join(summary.get("fields") or []) or "нет"
+        buttons = ", ".join(summary.get("buttons") or []) or "нет"
+        return f"{page.url} · поля: {fields} · кнопки: {buttons}"
 
     @staticmethod
     def code_field(page):
@@ -1201,10 +1223,18 @@ class App:
             return
         login_field = password_field = None
         login_sent = False
+        entry_clicks = 0
         for _ in range(attempts):
             login_field, password_field = self.login_fields(page)
             if password_field:
                 break
+            if login_field is None and entry_clicks < 2:
+                entry = self.entry_button(page)
+                if entry is not None and self.press(entry):
+                    entry_clicks += 1
+                    self.log("AUTH", f"{account['title']}: открываю страницу входа")
+                    self.stop.wait(3)
+                    continue
             if login_field and not login_sent:
                 try:
                     login_field.fill(login)
@@ -1344,23 +1374,30 @@ class App:
                     continue
         return None
 
-    def press_presence(self, button) -> bool:
-        """Нажимает кнопку присутствия
+    @staticmethod
+    def press(element) -> bool:
+        """Нажимает элемент
 
         В неактивной вкладке Chrome не доставляет настоящие события мыши,
         поэтому запасной вариант — событие click из самой страницы.
         """
         try:
-            button.click(timeout=3000)
+            element.click(timeout=3000)
             return True
         except PlaywrightError:
-            LOGGER.info("Presence button click timed out, falling back to DOM event")
+            LOGGER.info("Click timed out, falling back to DOM event")
         try:
-            button.dispatch_event("click")
+            element.dispatch_event("click")
             return True
         except PlaywrightError as exc:
-            self.log("PRESENCE", "Не удалось нажать кнопку подтверждения: " + self.short(exc))
+            LOGGER.info("DOM click failed: %s", exc)
             return False
+
+    def press_presence(self, button) -> bool:
+        if self.press(button):
+            return True
+        self.log("PRESENCE", "Не удалось нажать кнопку подтверждения")
+        return False
 
     def page_token(self, page) -> str | None:
         """Ищет QR-код Pulse на снимке вкладки"""
