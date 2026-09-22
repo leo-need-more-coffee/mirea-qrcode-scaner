@@ -378,6 +378,7 @@ class App:
         self.bot_thread: threading.Thread | None = None
         self.code_answer: queue.Queue | None = None
         self.login_attempts: dict[str, float] = {}
+        self.link_waiting = False
         self.code_window = None
         self.pair_code = ""
         self.browser_busy = False
@@ -759,8 +760,16 @@ class App:
         try:
             # Вебхук и опрос вместе не работают, поэтому вебхук снимается
             telegram_call(token, "deleteWebhook", {"drop_pending_updates": False}, timeout=15)
+            telegram_call(token, "setMyCommands", {"commands": [
+                {"command": "menu", "description": "Кнопки управления"},
+                {"command": "status", "description": "Что сейчас происходит"},
+                {"command": "login", "description": "Проверить сессии и войти"},
+                {"command": "scan", "description": "Искать QR на экранах"},
+                {"command": "stop", "description": "Остановить поиск QR"},
+                {"command": "lecture", "description": "Открыть занятие"},
+                {"command": "close", "description": "Закрыть окно лекции"}]}, timeout=15)
         except (urllib.error.URLError, OSError, ValueError):
-            LOGGER.info("deleteWebhook failed")
+            LOGGER.info("Bot setup call failed")
         self.log("BOT", "Бот слушает команды")
         while self.bot_alive():
             try:
@@ -793,8 +802,91 @@ class App:
             self.bot_thread = None
             self.log("BOT", "Бот остановлен")
 
+    def bot_text(self) -> str:
+        """Короткая сводка для экрана бота"""
+        logged = [item["title"] for item in self.settings["accounts"] if item["name"]]
+        enabled = [item["title"] for item in self.enabled_accounts()]
+        link = self.settings.get("lecture_url") or "не задана"
+        lines = [f"{APP_NAME}",
+                 "",
+                 f"Вошли: {', '.join(logged) if logged else 'никто'}",
+                 f"Подтверждают QR: {', '.join(enabled) if enabled else 'никто'}",
+                 f"Поиск QR на экранах: {'идёт' if self.scanning else 'остановлен'}",
+                 f"Окно лекции: {'открыто' if self.lecture else 'закрыто'}",
+                 f"Ссылка занятия: {link}"]
+        return "\n".join(lines)
+
+    def bot_keyboard(self) -> dict:
+        scan = "Остановить поиск QR" if self.scanning else "Искать QR на экранах"
+        lecture = "Закрыть лекцию" if self.lecture else "Открыть лекцию"
+        return {"inline_keyboard": [
+            [{"text": lecture, "callback_data": "lecture"}],
+            [{"text": scan, "callback_data": "scan"}],
+            [{"text": "Ссылка занятия", "callback_data": "link"},
+             {"text": "Аккаунты", "callback_data": "accounts"}],
+            [{"text": "Войти заново", "callback_data": "login"},
+             {"text": "Обновить", "callback_data": "refresh"}],
+        ]}
+
+    def accounts_text(self) -> str:
+        return (f"{APP_NAME}\n\nОтмеченные аккаунты подтверждают найденный QR.\n"
+                "Нажмите на аккаунт, чтобы включить или выключить его.")
+
+    def accounts_keyboard(self) -> dict:
+        rows = []
+        for account in self.settings["accounts"]:
+            mark = "✅" if account.get("enabled") else "⬜"
+            state = account["name"] or ("автовход" if account.get("login") else "нет входа")
+            rows.append([{"text": f"{mark} {account['title']} · {state}", "callback_data": "toggle:" + account["id"]}])
+        rows.append([{"text": "Назад", "callback_data": "back"}])
+        return {"inline_keyboard": rows}
+
+    def send_menu(self, token: str, chat: int) -> None:
+        telegram_call(token, "sendMessage", {"chat_id": chat, "text": self.bot_text(),
+                                             "reply_markup": self.bot_keyboard()})
+
+    def bot_action(self, data: str) -> str:
+        """Выполняет нажатие кнопки и возвращает короткий ответ"""
+        if data == "refresh":
+            return "Обновлено"
+        if data == "link":
+            self.link_waiting = True
+            return "Пришлите ссылку сообщением"
+        if data == "login":
+            return self.bot_command("/login")
+        if data == "scan":
+            return self.bot_command("/stop" if self.scanning else "/scan")
+        if data == "lecture":
+            return self.bot_command("/close" if self.lecture else "/lecture")
+        if data.startswith("toggle:"):
+            for account in self.settings["accounts"]:
+                if account["id"] == data.split(":", 1)[1]:
+                    account["enabled"] = not account.get("enabled")
+                    self.save_settings()
+                    self.post("accounts", None)
+                    return f"{account['title']}: {'подтверждает QR' if account['enabled'] else 'не участвует'}"
+        return ""
+
+    def handle_callback(self, token: str, callback: dict) -> None:
+        """Обрабатывает нажатие кнопки под сообщением"""
+        message = callback.get("message") or {}
+        chat = (message.get("chat") or {}).get("id")
+        if chat != self.settings.get("telegram_chat"):
+            return
+        data = callback.get("data", "")
+        answer = self.bot_action(data)
+        telegram_call(token, "answerCallbackQuery", {"callback_query_id": callback.get("id"), "text": answer[:190]})
+        accounts_screen = data == "accounts" or data.startswith("toggle:")
+        telegram_call(token, "editMessageText", {
+            "chat_id": chat, "message_id": message.get("message_id"),
+            "text": self.accounts_text() if accounts_screen else self.bot_text(),
+            "reply_markup": self.accounts_keyboard() if accounts_screen else self.bot_keyboard()})
+
     def handle_update(self, token: str, update: dict) -> None:
-        """Привязывает чат по коду и отвечает на команды только привязанному чату"""
+        """Привязывает чат по коду и отвечает только привязанному чату"""
+        if update.get("callback_query"):
+            self.handle_callback(token, update["callback_query"])
+            return
         message = update.get("message") or {}
         chat = (message.get("chat") or {}).get("id")
         text = (message.get("text") or "").strip()
@@ -809,9 +901,12 @@ class App:
                 self.save_settings()
                 self.post("telegram", None)
                 self.log("BOT", "Чат привязан, команды доступны")
-                telegram_call(token, "sendMessage", {"chat_id": chat, "text": self.bot_command("/help")})
+                self.send_menu(token, chat)
             return
         if chat != known:
+            return
+        if text.startswith("/start") or text.startswith("/menu"):
+            self.send_menu(token, chat)
             return
         telegram_call(token, "sendMessage", {"chat_id": chat, "text": self.bot_command(text)})
 
@@ -822,6 +917,14 @@ class App:
             if waiting.empty():
                 waiting.put(text)
             return "Код принят"
+        if self.link_waiting and not text.startswith("/"):
+            self.link_waiting = False
+            if not text.startswith(("http://", "https://")):
+                return "Ссылка должна начинаться с http:// или https://"
+            self.settings["lecture_url"] = text
+            self.save_settings()
+            self.root.after(0, lambda: self.lecture_link.set(text))
+            return "Ссылка сохранена. Нажмите «Открыть лекцию»"
         command = text.split()[0].lower().split("@")[0]
         if command == "/status":
             logged = [item["title"] for item in self.settings["accounts"] if item["name"]]
@@ -871,8 +974,8 @@ class App:
                 return "Окно лекции не открыто"
             self.root.after(0, self.toggle_lecture)
             return "Закрываю окно лекции"
-        return ("Команды:\n/status — что сейчас происходит\n/login — проверить сессии и войти\n"
-                "/scan — начать поиск QR\n"
+        return ("Кнопки управления: /menu\n\nКоманды:\n/status — что сейчас происходит\n"
+                "/login — проверить сессии и войти\n/scan — начать поиск QR\n"
                 "/stop — остановить поиск\n/lecture — открыть занятие\n"
                 "/lecture <ссылка> — запомнить ссылку и открыть её\n/close — закрыть окно лекции")
 
