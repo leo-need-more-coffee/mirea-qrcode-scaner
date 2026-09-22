@@ -16,9 +16,9 @@ import time
 import tkinter as tk
 import webbrowser
 from pathlib import Path
-from tkinter import font as tkfont, messagebox, ttk
+from tkinter import font as tkfont, messagebox, simpledialog, ttk
 from urllib.parse import parse_qs, unquote, unquote_plus, urlparse
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
@@ -41,7 +41,8 @@ def data_dir() -> Path:
 
 
 DATA_DIR = data_dir()
-CHROME_PROFILE = DATA_DIR / "pulse-chrome-profile"
+LEGACY_PROFILE = DATA_DIR / "pulse-chrome-profile"
+ACCOUNTS_DIR = DATA_DIR / "accounts"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 RUN_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", RUN_DIR))
@@ -104,13 +105,45 @@ def logger() -> logging.Logger:
 LOGGER = logger()
 
 
+def profile_path(account_id: str) -> Path:
+    """Папка Chrome для отдельного аккаунта Pulse"""
+    return ACCOUNTS_DIR / account_id / "pulse-chrome-profile"
+
+
+def new_account(title: str) -> dict:
+    return {"id": uuid4().hex[:12], "title": title, "enabled": True, "name": ""}
+
+
 def load_settings() -> dict:
-    data = {"cooldown_minutes": 10}
+    """Настройки вместе со списком аккаунтов; старые файлы дополняются аккаунтом по умолчанию"""
+    data = {"cooldown_minutes": 10, "accounts": [], "current": ""}
     try:
         data.update(json.loads(SETTINGS_PATH.read_text(encoding="utf-8")))
     except (OSError, ValueError, TypeError):
         pass
+    accounts = [item for item in data.get("accounts", []) if isinstance(item, dict) and item.get("id")]
+    if not accounts:
+        accounts = [{"id": "default", "title": "Аккаунт 1", "enabled": True, "name": ""}]
+    for account in accounts:
+        account.setdefault("title", "Аккаунт")
+        account.setdefault("enabled", True)
+        account.setdefault("name", "")
+    data["accounts"] = accounts
+    if data.get("current") not in [account["id"] for account in accounts]:
+        data["current"] = accounts[0]["id"]
     return data
+
+
+def migrate_profile() -> None:
+    """Переносит единственный профиль прежних версий в папку первого аккаунта"""
+    target = profile_path("default")
+    if LEGACY_PROFILE.exists() and not target.exists():
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(LEGACY_PROFILE), str(target))
+            LOGGER.info("Profile moved to %s", target)
+        except OSError:
+            LOGGER.exception("Profile migration failed")
 
 
 def qr_token(value: str) -> str | None:
@@ -234,12 +267,13 @@ def system_browser() -> str | None:
     return None
 
 
-def launch_context(playwright, headless: bool):
+def launch_context(playwright, headless: bool, profile: Path):
     """Открывает профиль Pulse: сначала официальный Chrome, затем браузер системы
 
     На Windows подходит канал chrome, в Linux Chrome часто установлен как chromium,
     поэтому запасным вариантом идёт найденный в PATH браузер.
     """
+    profile.mkdir(parents=True, exist_ok=True)
     attempts: list[dict] = [{"channel": "chrome"}]
     executable = system_browser()
     if executable:
@@ -248,7 +282,7 @@ def launch_context(playwright, headless: bool):
     failure = None
     for options in attempts:
         try:
-            context = playwright.chromium.launch_persistent_context(str(CHROME_PROFILE), headless=headless, **options)
+            context = playwright.chromium.launch_persistent_context(str(profile), headless=headless, **options)
             LOGGER.info("Browser started with %s", options)
             return context
         except PlaywrightError as exc:
@@ -262,7 +296,8 @@ class App:
 
     def __init__(self) -> None:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        CHROME_PROFILE.mkdir(parents=True, exist_ok=True)
+        ACCOUNTS_DIR.mkdir(parents=True, exist_ok=True)
+        migrate_profile()
         self.settings = load_settings()
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.stop = threading.Event()
@@ -273,8 +308,8 @@ class App:
         self.last_success = 0.0
         self.root = tk.Tk()
         self.root.title(APP_NAME)
-        self.root.geometry("760x670")
-        self.root.minsize(680, 670)
+        self.root.geometry("940x900")
+        self.root.minsize(860, 800)
         self.root.configure(bg=self.BG)
         self.font = pick_font(self.root, UI_FONTS, "TkDefaultFont")
         self.mono = pick_font(self.root, MONO_FONTS, "TkFixedFont")
@@ -379,6 +414,8 @@ class App:
         state.pack(fill="x", pady=(0, 10))
         self.account_label = self.label(state, "Pulse: проверяю сессию…", bold=True, color="#cfe1ff")
         self.account_label.pack(anchor="w")
+        self.accounts_label = self.label(state, f"Подтверждаем за аккаунтов: {len(self.enabled_accounts())} из {len(self.settings['accounts'])}", 9, color=self.MUTED)
+        self.accounts_label.pack(anchor="w", pady=(2, 0))
         self.status_label = self.label(state, "Запуск интерфейса…", color=self.MUTED)
         self.status_label.pack(anchor="w", pady=(6, 10))
         controls = tk.Frame(state, bg=self.CARD)
@@ -437,25 +474,28 @@ class App:
                 LOGGER.exception("Donation QR cannot be loaded")
         profile = self.card(self.settings_page)
         profile.pack(fill="x")
-        self.label(profile, "Профиль сессии Pulse", 11, True).pack(anchor="w")
-        self.label(profile, str(CHROME_PROFILE), 9, True, "#cfe1ff").pack(anchor="w", pady=(6, 3))
-        self.label(profile, "Chrome хранит здесь Cookie и данные входа. Не передавайте папку другим людям.", 9, color=self.MUTED).pack(anchor="w")
+        self.label(profile, "Аккаунты Pulse", 11, True).pack(anchor="w")
+        self.label(profile, "Каждый аккаунт входит сам и хранит свою сессию.\nОтметка QR — аккаунт подтверждает найденный код.", 9, color=self.MUTED, justify="left").pack(anchor="w", pady=(6, 8))
+        self.accounts_box = tk.Frame(profile, bg=self.CARD)
+        self.accounts_box.pack(fill="x")
         buttons = tk.Frame(profile, bg=self.CARD)
-        buttons.pack(anchor="w", pady=(8, 0))
-        self.button(buttons, text="Копировать путь", command=self.copy_profile).pack(side="left")
-        self.button(buttons, text=OPEN_FOLDER_TEXT, style="Secondary.TButton", command=self.open_profile).pack(side="left", padx=8)
-        self.button(buttons, text="Выйти", style="Danger.TButton", command=self.logout).pack(side="left")
+        buttons.pack(anchor="w", pady=(10, 0))
+        self.button(buttons, text="Добавить аккаунт", command=self.add_account).pack(side="left")
+        self.button(buttons, text="Копировать путь", style="Secondary.TButton", command=self.copy_profile).pack(side="left", padx=8)
+        self.button(buttons, text=OPEN_FOLDER_TEXT, style="Secondary.TButton", command=self.open_profile).pack(side="left")
+        self.draw_accounts()
 
     def open_profile(self) -> None:
-        """Открывает папку профиля системным файловым менеджером"""
+        """Открывает папку профиля активного аккаунта системным файловым менеджером"""
+        folder = profile_path(self.settings["current"])
         try:
-            CHROME_PROFILE.mkdir(parents=True, exist_ok=True)
+            folder.mkdir(parents=True, exist_ok=True)
             if sys.platform == "win32":
-                os.startfile(CHROME_PROFILE)
+                os.startfile(folder)
             elif sys.platform == "darwin":
-                subprocess.Popen(["open", str(CHROME_PROFILE)])
+                subprocess.Popen(["open", str(folder)])
             else:
-                subprocess.Popen(["xdg-open", str(CHROME_PROFILE)])
+                subprocess.Popen(["xdg-open", str(folder)])
         except (OSError, subprocess.SubprocessError) as exc:
             LOGGER.exception("Profile folder cannot be opened")
             self.log("UI", "Не удалось открыть папку профиля: " + self.short(exc))
@@ -487,7 +527,7 @@ class App:
                 elif kind == "account":
                     self.account = value
                     if value:
-                        self.account_label.configure(text=f"Pulse: {value}")
+                        self.account_label.configure(text=f"Pulse: {value} · {self.current_account()['title']}")
                         self.login_button.pack_forget()
                     else:
                         self.account_label.configure(text="Pulse: вход не выполнен")
@@ -495,6 +535,10 @@ class App:
                             self.login_button.pack(side="left")
                 elif kind == "scan":
                     self.scan_button.configure(text="Остановить сканирование" if value else "Начать сканирование")
+                elif kind == "accounts":
+                    self.draw_accounts()
+                    enabled = len(self.enabled_accounts())
+                    self.accounts_label.configure(text=f"Подтверждаем за аккаунтов: {enabled} из {len(self.settings['accounts'])}")
                 elif kind == "lecture":
                     self.lecture_button.configure(text="Закрыть лекцию" if value else "Открыть лекцию")
         except queue.Empty:
@@ -505,6 +549,88 @@ class App:
     def post(self, kind: str, value: object) -> None:
         self.events.put((kind, value))
 
+    def current_account(self, account_id: str | None = None) -> dict:
+        """Аккаунт по идентификатору, по умолчанию активный"""
+        wanted = account_id or self.settings["current"]
+        for item in self.settings["accounts"]:
+            if item["id"] == wanted:
+                return item
+        return self.settings["accounts"][0]
+
+    def enabled_accounts(self) -> list[dict]:
+        """Аккаунты, которые подтверждают найденный QR"""
+        return [item for item in self.settings["accounts"] if item.get("enabled")] or [self.current_account()]
+
+    def save_settings(self) -> None:
+        SETTINGS_PATH.write_text(json.dumps(self.settings, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def draw_accounts(self) -> None:
+        """Перерисовывает список аккаунтов на странице настроек"""
+        for child in self.accounts_box.winfo_children():
+            child.destroy()
+        self.current_choice = tk.StringVar(value=self.settings["current"])
+        for account in self.settings["accounts"]:
+            row = tk.Frame(self.accounts_box, bg=self.CARD)
+            row.pack(fill="x", pady=3)
+            # Кнопки занимают место первыми, иначе длинное имя вытесняет их за край строки
+            self.button(row, text="Удалить", style="Danger.TButton",
+                        command=lambda item=account: self.remove_account(item)).pack(side="right")
+            self.button(row, text="Выйти", style="Secondary.TButton",
+                        command=lambda item=account: self.logout(item)).pack(side="right", padx=8)
+            enabled = tk.BooleanVar(value=bool(account["enabled"]))
+            tk.Checkbutton(row, text="QR", variable=enabled, bg=self.CARD, fg=self.MUTED,
+                           selectcolor=self.FIELD, activebackground=self.CARD, activeforeground=self.MUTED,
+                           highlightthickness=0, font=(self.font, 9),
+                           command=lambda item=account, flag=enabled: self.toggle_account(item, flag)).pack(side="right", padx=8)
+            title = account["title"] + " · " + (account["name"] or "нет входа")
+            tk.Radiobutton(row, text=title, variable=self.current_choice, value=account["id"],
+                           command=self.select_account, bg=self.CARD, fg=self.TEXT, selectcolor=self.FIELD,
+                           activebackground=self.CARD, activeforeground=self.TEXT, highlightthickness=0,
+                           anchor="w", font=(self.font, 10, "bold")).pack(side="left", fill="x", expand=True)
+
+    def select_account(self) -> None:
+        self.settings["current"] = self.current_choice.get()
+        self.save_settings()
+        account = self.current_account()
+        self.post("account", account["name"])
+        self.log("ACCOUNT", f"Активный аккаунт: {account['title']}")
+
+    def toggle_account(self, account: dict, flag) -> None:
+        account["enabled"] = bool(flag.get())
+        self.save_settings()
+        self.post("accounts", None)
+        self.log("ACCOUNT", f"{account['title']}: {'участвует' if account['enabled'] else 'не участвует'} в подтверждении")
+
+    def add_account(self) -> None:
+        title = simpledialog.askstring(APP_NAME, "Название аккаунта", parent=self.root)
+        if not title or not title.strip():
+            return
+        account = new_account(title.strip()[:40])
+        self.settings["accounts"].append(account)
+        self.settings["current"] = account["id"]
+        self.save_settings()
+        self.post("accounts", None)
+        self.log("ACCOUNT", f"Добавлен аккаунт {account['title']}. Нажмите «Войти в Pulse» для входа")
+        self.post("status", "Аккаунт добавлен — войдите в Pulse")
+
+    def remove_account(self, account: dict) -> None:
+        if len(self.settings["accounts"]) == 1:
+            messagebox.showinfo(APP_NAME, "Нужен хотя бы один аккаунт")
+            return
+        if self.browser_busy:
+            messagebox.showinfo(APP_NAME, "Сначала завершите проверку или вход в Pulse")
+            return
+        if not messagebox.askyesno(APP_NAME, f"Удалить аккаунт «{account['title']}» вместе с его сессией?"):
+            return
+        shutil.rmtree(profile_path(account["id"]).parent, ignore_errors=True)
+        self.settings["accounts"].remove(account)
+        if self.settings["current"] == account["id"]:
+            self.settings["current"] = self.settings["accounts"][0]["id"]
+        self.save_settings()
+        self.post("accounts", None)
+        self.post("account", self.current_account()["name"])
+        self.log("ACCOUNT", f"Аккаунт {account['title']} удалён")
+
     def save_cooldown(self) -> None:
         try:
             minutes = int(self.cooldown.get())
@@ -514,13 +640,13 @@ class App:
             messagebox.showerror(APP_NAME, "Введите целое число от 1 до 180")
             return
         self.settings["cooldown_minutes"] = minutes
-        SETTINGS_PATH.write_text(json.dumps(self.settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.save_settings()
         self.log("SETTINGS", f"Пауза после успеха: {minutes} мин.")
         self.post("status", "Настройки сохранены")
 
     def copy_profile(self) -> None:
         self.root.clipboard_clear()
-        self.root.clipboard_append(str(CHROME_PROFILE))
+        self.root.clipboard_append(str(profile_path(self.settings["current"])))
         self.post("status", "Путь профиля скопирован")
 
     def state(self, page) -> tuple[str, bool]:
@@ -538,24 +664,26 @@ class App:
         threading.Thread(target=self.check_worker, daemon=True).start()
 
     def check_worker(self) -> None:
+        """Проверяет сохранённую сессию каждого аккаунта по очереди"""
         try:
             with sync_playwright() as p:
-                ctx = launch_context(p, headless=True)
-                name, logged = self.state(ctx.pages[0] if ctx.pages else ctx.new_page())
-                ctx.close()
-            if logged:
-                self.post("account", name)
-                self.post("status", "Сессия активна")
-                self.log("AUTH", f"Сессия активна: {name}.")
-            else:
-                self.post("account", "")
-                self.post("status", "Войдите в Pulse")
-                self.log("AUTH", "Сессия не найдена")
-        except Exception as exc:
-            LOGGER.exception("Session check failure")
-            self.post("account", "")
-            self.post("status", "Не удалось проверить сессию — откройте вход")
-            self.log("AUTH", "Проверка сессии недоступна: " + self.short(exc))
+                for account in self.settings["accounts"]:
+                    try:
+                        ctx = launch_context(p, headless=True, profile=profile_path(account["id"]))
+                        name, logged = self.state(ctx.pages[0] if ctx.pages else ctx.new_page())
+                        ctx.close()
+                    except Exception as exc:
+                        LOGGER.exception("Session check failure")
+                        account["name"] = ""
+                        self.log("AUTH", f"{account['title']}: проверка недоступна — " + self.short(exc))
+                        continue
+                    account["name"] = name if logged else ""
+                    self.log("AUTH", f"{account['title']}: " + (f"сессия активна, {name}" if logged else "вход не выполнен"))
+            self.save_settings()
+            self.post("accounts", None)
+            self.post("account", self.current_account()["name"])
+            logged_in = [item for item in self.settings["accounts"] if item["name"]]
+            self.post("status", f"Сессий активно: {len(logged_in)} из {len(self.settings['accounts'])}" if logged_in else "Войдите в Pulse")
         finally:
             self.browser_busy = False
 
@@ -564,14 +692,15 @@ class App:
             self.post("status", "Уже выполняется проверка или вход…")
             return
         self.browser_busy = True
-        self.post("status", "Завершите вход и 2FA в окне Chrome")
-        self.log("AUTH", "Открыто официальное окно Pulse для входа")
+        self.post("status", f"Завершите вход и 2FA в окне Chrome: {self.current_account()['title']}")
+        self.log("AUTH", f"{self.current_account()['title']}: открыто официальное окно Pulse для входа")
         threading.Thread(target=self.login_worker, daemon=True).start()
 
     def login_worker(self) -> None:
         try:
             with sync_playwright() as p:
-                ctx = launch_context(p, headless=False)
+                account = self.current_account()
+                ctx = launch_context(p, headless=False, profile=profile_path(account["id"]))
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 page.goto(PULSE_HOME, wait_until="domcontentloaded", timeout=60000)
                 for _ in range(600):
@@ -582,9 +711,12 @@ class App:
                         name = str(state.get("name", "")).strip()
                         if name and state.get("onPulse"):
                             ctx.close()
+                            account["name"] = name
+                            self.save_settings()
+                            self.post("accounts", None)
                             self.post("account", name)
                             self.post("status", "Сессия активна")
-                            self.log("AUTH", f"Вход завершён: {name}.")
+                            self.log("AUTH", f"{account['title']}: вход завершён, {name}")
                             return
                     except PlaywrightError:
                         break
@@ -661,13 +793,33 @@ class App:
                     return token
         return None
 
+    def approve_lecture(self, playwright, pulse, current: dict, token: str) -> tuple[bool, str]:
+        """Подтверждает QR за открытый аккаунт и за остальные отмеченные профили"""
+        approved, failure = 0, ""
+        for account in self.enabled_accounts():
+            if account["id"] == current["id"]:
+                try:
+                    ok, detail = self.approve_request(pulse, token)
+                except PlaywrightError as exc:
+                    ok, detail = False, self.short(exc)
+            else:
+                ok, detail = self.approve_account(playwright, account, token)
+            if ok:
+                approved += 1
+                self.log("PULSE", f"{account['title']}: QR принят")
+            else:
+                failure = failure or detail
+                self.log("PULSE", f"{account['title']}: отказ — {detail}")
+        return approved > 0, failure
+
     def lecture_worker(self) -> None:
         """Ведёт вкладки лекции: подтверждает присутствие и ловит QR прямо в браузере"""
         confirmed_tokens: set[str] = set()
         qr_successes = 0
         try:
             with sync_playwright() as p:
-                ctx = launch_context(p, headless=False)
+                current = self.current_account()
+                ctx = launch_context(p, headless=False, profile=profile_path(current["id"]))
                 pulse = ctx.pages[0] if ctx.pages else ctx.new_page()
                 pulse.goto(PULSE_HOME, wait_until="domcontentloaded", timeout=60000)
                 lecture = ctx.new_page()
@@ -698,7 +850,7 @@ class App:
                             continue
                         attempt = qr_successes + 1
                         self.log("SCAN", f"Найден новый QR Pulse во вкладке. Подтверждение {attempt}/3")
-                        ok, detail = self.approve_request(pulse, token)
+                        ok, detail = self.approve_lecture(p, pulse, current, token)
                         if ok:
                             confirmed_tokens.add(token)
                             qr_successes += 1
@@ -878,33 +1030,57 @@ class App:
             return True, ""
         return False, grpc_message or f"HTTP {result.get('status')}; gRPC {grpc_status or 'не указан'}"
 
-    def approve(self, token: str) -> tuple[bool, str]:
-        if self.browser_busy:
-            return False, "завершите вход в Pulse"
+    def approve_account(self, playwright, account: dict, token: str) -> tuple[bool, str]:
+        """Подтверждает QR в отдельном профиле аккаунта"""
         try:
-            with sync_playwright() as p:
-                ctx = launch_context(p, headless=True)
-                page = ctx.pages[0] if ctx.pages else ctx.new_page()
-                page.goto(PULSE_HOME, wait_until="domcontentloaded", timeout=60000)
-                answer = self.approve_request(page, token)
-                ctx.close()
+            ctx = launch_context(playwright, headless=True, profile=profile_path(account["id"]))
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.goto(PULSE_HOME, wait_until="domcontentloaded", timeout=60000)
+            answer = self.approve_request(page, token)
+            ctx.close()
             return answer
         except Exception as exc:
             LOGGER.exception("Approval failure")
             return False, self.short(exc)
 
-    def logout(self) -> None:
+    def approve(self, token: str) -> tuple[bool, str]:
+        """Подтверждает QR за каждый отмеченный аккаунт"""
+        if self.browser_busy:
+            return False, "завершите вход в Pulse"
+        approved, failure = 0, ""
+        try:
+            with sync_playwright() as p:
+                for account in self.enabled_accounts():
+                    ok, detail = self.approve_account(p, account, token)
+                    if ok:
+                        approved += 1
+                        self.log("PULSE", f"{account['title']}: QR принят")
+                    else:
+                        failure = failure or detail
+                        self.log("PULSE", f"{account['title']}: отказ — {detail}")
+        except Exception as exc:
+            LOGGER.exception("Approval failure")
+            return False, self.short(exc)
+        return approved > 0, failure
+
+    def logout(self, account: dict | None = None) -> None:
+        account = account or self.current_account()
         if self.browser_busy:
             messagebox.showinfo(APP_NAME, "Сначала завершите проверку или вход в Pulse")
             return
-        if not messagebox.askyesno(APP_NAME, "Сбросить сохранённую сессию Pulse? Потребуется войти заново"):
+        if not messagebox.askyesno(APP_NAME, f"Сбросить сессию аккаунта «{account['title']}»? Потребуется войти заново"):
             return
+        folder = profile_path(account["id"])
         try:
-            shutil.rmtree(CHROME_PROFILE)
-            CHROME_PROFILE.mkdir(parents=True, exist_ok=True)
-            self.post("account", "")
-            self.post("status", "Сессия сброшена")
-            self.log("AUTH", "Сохранённая сессия удалена пользователем")
+            shutil.rmtree(folder)
+            folder.mkdir(parents=True, exist_ok=True)
+            account["name"] = ""
+            self.save_settings()
+            self.post("accounts", None)
+            if account["id"] == self.settings["current"]:
+                self.post("account", "")
+            self.post("status", f"Сессия аккаунта «{account['title']}» сброшена")
+            self.log("AUTH", f"{account['title']}: сохранённая сессия удалена")
         except OSError as exc:
             messagebox.showerror(APP_NAME, "Не удалось удалить профиль. Закройте окно Chrome Pulse и повторите\n\n" + str(exc))
 
