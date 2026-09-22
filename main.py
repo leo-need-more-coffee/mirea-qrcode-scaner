@@ -1078,7 +1078,7 @@ class App:
                     self.post("account", name)
                     self.log("AUTH", f"{account['title']}: вход выполнен автоматически, {name}")
                     return True
-            self.log("AUTH", f"{account['title']}: автоматический вход не удался, войдите вручную")
+            self.log("AUTH", f"{account['title']}: автоматический вход не удался — {self.page_summary(page)}")
             return False
         finally:
             ctx.close()
@@ -1094,17 +1094,37 @@ class App:
 
     @staticmethod
     def login_fields(page):
-        """Поля логина и пароля в любом кадре страницы входа"""
+        """Видимые поля логина и пароля; SSO может показывать их на разных шагах"""
+        login_field = password_field = None
         for frame in page.frames:
             try:
-                password = frame.locator("input[type=password]:visible")
-                if not password.count():
-                    continue
-                login = frame.locator("input[type=text]:visible, input[type=email]:visible, input[type=tel]:visible")
-                return login.first if login.count() else None, password.first
+                if password_field is None:
+                    password = frame.locator("input[type=password]:visible, input[name*='pass' i]:visible")
+                    if password.count():
+                        password_field = password.first
+                if login_field is None:
+                    login = frame.locator("input[type=text]:visible, input[type=email]:visible, "
+                                          "input[type=tel]:visible, input[name*='login' i]:visible, "
+                                          "input[name*='user' i]:visible")
+                    if login.count():
+                        login_field = login.first
             except PlaywrightError:
                 continue
-        return None, None
+            if password_field is not None and login_field is not None:
+                break
+        return login_field, password_field
+
+    @staticmethod
+    def page_summary(page) -> str:
+        """Куда попала страница и какие поля на ней видны — без значений"""
+        try:
+            fields = page.evaluate("""() => [...document.querySelectorAll('input')]
+                .filter(item => item.offsetParent !== null)
+                .map(item => (item.type || 'text') + (item.name ? ':' + item.name : ''))
+                .slice(0, 8)""")
+        except PlaywrightError:
+            fields = []
+        return f"{page.url} · поля: {', '.join(fields) or 'нет'}"
 
     @staticmethod
     def code_field(page):
@@ -1179,18 +1199,28 @@ class App:
         password = load_password(account["id"]) if login else ""
         if not login or not password:
             return
+        login_field = password_field = None
+        login_sent = False
         for _ in range(attempts):
             login_field, password_field = self.login_fields(page)
             if password_field:
                 break
+            if login_field and not login_sent:
+                try:
+                    login_field.fill(login)
+                    login_field.press("Enter")
+                    login_sent = True
+                    self.log("AUTH", f"{account['title']}: логин отправлен, жду поле пароля")
+                except PlaywrightError:
+                    pass
             if self.stop.wait(1):
                 return
-        else:
+        if not password_field:
             if not quiet:
-                self.log("AUTH", f"{account['title']}: форма входа не найдена, войдите вручную")
+                self.log("AUTH", f"{account['title']}: форма входа не найдена — {self.page_summary(page)}")
             return
         try:
-            if login_field:
+            if login_field and not login_sent:
                 login_field.fill(login)
             password_field.fill(password)
             password_field.press("Enter")
@@ -1198,6 +1228,9 @@ class App:
         except PlaywrightError as exc:
             self.log("AUTH", f"{account['title']}: не удалось заполнить форму — " + self.short(exc))
             return
+        self.stop.wait(4)
+        if self.login_fields(page)[1] is not None and not quiet:
+            self.log("AUTH", f"{account['title']}: сайт не принял данные входа — {self.page_summary(page)}")
         for _ in range(20):
             if self.stop.wait(1):
                 return
