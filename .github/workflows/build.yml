@@ -1,0 +1,149 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.title }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            system: linux
+            title: Linux
+          - os: windows-latest
+            system: windows
+            title: Windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Проверка синтаксиса
+        run: python -m py_compile main.py
+
+      - name: Системные библиотеки
+        if: matrix.system == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-tk libx11-6 libxtst6 libxcb1 xdotool xvfb
+
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Сборка приложения для Linux
+        if: matrix.system == 'linux'
+        run: >
+          pyinstaller --noconfirm --clean --onedir --exclude-module numpy
+          --hidden-import PIL._tkinter_finder
+          --add-data "assets/shalost-fotur.ico:assets"
+          --add-data "assets/shalost-fotur.png:assets"
+          --name Shalost-FOTUR main.py
+
+      - name: Сборка приложения для Windows
+        if: matrix.system == 'windows'
+        shell: pwsh
+        run: >
+          pyinstaller --noconfirm --clean --onedir --windowed --exclude-module numpy
+          --hidden-import PIL._tkinter_finder --icon assets/shalost-fotur.ico
+          --add-data "assets/shalost-fotur.ico;assets"
+          --add-data "assets/shalost-fotur.png;assets"
+          --name Shalost-FOTUR main.py
+
+      - name: Проверка запуска в Linux
+        if: matrix.system == 'linux'
+        run: |
+          xvfb-run -a dist/Shalost-FOTUR/Shalost-FOTUR &
+          for _ in $(seq 40); do
+            grep -q "Интерфейс готов" dist/Shalost-FOTUR/pulseqr.log 2>/dev/null && break
+            sleep 1
+          done
+          pkill -x Shalost-FOTUR || true
+          cat dist/Shalost-FOTUR/pulseqr.log
+          grep -q "Интерфейс готов" dist/Shalost-FOTUR/pulseqr.log
+          rm -f dist/Shalost-FOTUR/pulseqr.log
+
+      - name: Проверка запуска в Windows
+        if: matrix.system == 'windows'
+        shell: pwsh
+        run: |
+          Start-Process -FilePath dist/Shalost-FOTUR/Shalost-FOTUR.exe
+          foreach ($attempt in 1..40) {
+            if ((Test-Path dist/Shalost-FOTUR/pulseqr.log) -and
+                (Select-String -Path dist/Shalost-FOTUR/pulseqr.log -Pattern "Интерфейс готов" -Quiet)) { break }
+            Start-Sleep -Seconds 1
+          }
+          Stop-Process -Name Shalost-FOTUR -Force -ErrorAction SilentlyContinue
+          Get-Content dist/Shalost-FOTUR/pulseqr.log
+          if (-not (Select-String -Path dist/Shalost-FOTUR/pulseqr.log -Pattern "Интерфейс готов" -Quiet)) {
+            throw "Приложение не запустилось"
+          }
+          Remove-Item dist/Shalost-FOTUR/pulseqr.log -Force
+
+      - name: Портативная сборка для Linux
+        if: matrix.system == 'linux'
+        run: |
+          cp packaging/linux/install.sh packaging/linux/uninstall.sh packaging/linux/shalost-fotur.desktop dist/Shalost-FOTUR/
+          chmod +x dist/Shalost-FOTUR/install.sh dist/Shalost-FOTUR/uninstall.sh
+          mkdir -p releases
+          tar -czf releases/Shalost-FOTUR-linux-x86_64.tar.gz -C dist Shalost-FOTUR
+
+      - name: AppImage
+        if: matrix.system == 'linux'
+        run: |
+          curl -sSL -o appimagetool.AppImage https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool.AppImage
+          APPIMAGETOOL="$PWD/appimagetool.AppImage --appimage-extract-and-run" packaging/linux/build-appimage.sh
+
+      - name: Портативная сборка для Windows
+        if: matrix.system == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path releases
+          Compress-Archive -Path dist/Shalost-FOTUR/* -DestinationPath releases/Shalost-FOTUR-portable.zip
+
+      - name: Установщик для Windows
+        if: matrix.system == 'windows'
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $version = if ("${{ github.ref }}" -match "^refs/tags/v(.+)$") { $Matches[1] } else { "0.1.0" }
+          iscc "/DMyAppVersion=$version" installer.iss
+
+      - name: Сохранение сборки
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shalost-FOTUR-${{ matrix.system }}
+          path: releases/*
+          if-no-files-found: error
+
+  release:
+    name: Публикация релиза
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: releases
+          merge-multiple: true
+      - name: Список файлов релиза
+        run: ls -la releases
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: releases/*

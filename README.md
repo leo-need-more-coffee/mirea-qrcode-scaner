@@ -135,7 +135,9 @@ AppImage собирается из готовой папки `dist/Shalost-FOTUR
 
     APPIMAGETOOL=/путь/к/appimagetool packaging/linux/build-appimage.sh
 
-Сценарии GitHub Actions собирают обе системы после push тега вида `v0.1.0`: Windows-версия выходит установщиком и ZIP, Linux-версия — tar.gz и AppImage.
+Сборкой занимается один сценарий GitHub Actions `build.yml`: при push в `main`, в pull request и вручную он собирает обе системы и проверяет, что приложение запускается — в Linux под Xvfb, в Windows обычным запуском. Готовые файлы остаются артефактами сборки.
+
+После push тега вида `v0.1.0` тот же сценарий публикует релиз: установщик и ZIP для Windows, tar.gz и AppImage для Linux.
 
 ## Лицензия
 
