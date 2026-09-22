@@ -842,9 +842,23 @@ class App:
         rows.append([{"text": "Назад", "callback_data": "back"}])
         return {"inline_keyboard": rows}
 
+    def telegram_send(self, token: str, method: str, payload: dict) -> None:
+        """Вызов Bot API, который не должен ронять обработку обновления
+
+        Telegram отвечает 400, если текст и кнопки экрана не изменились,
+        и это нормальная ситуация: нажали «Обновить», а менять нечего.
+        """
+        try:
+            telegram_call(token, method, payload)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 400:
+                LOGGER.info("Telegram %s failed: %s", method, exc)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            LOGGER.info("Telegram %s failed: %s", method, exc)
+
     def send_menu(self, token: str, chat: int) -> None:
-        telegram_call(token, "sendMessage", {"chat_id": chat, "text": self.bot_text(),
-                                             "reply_markup": self.bot_keyboard()})
+        self.telegram_send(token, "sendMessage", {"chat_id": chat, "text": self.bot_text(),
+                                                  "reply_markup": self.bot_keyboard()})
 
     def bot_action(self, data: str) -> str:
         """Выполняет нажатие кнопки и возвращает короткий ответ"""
@@ -878,9 +892,12 @@ class App:
         data = callback.get("data", "")
         LOGGER.info("Callback %s from chat %s", data, chat)
         answer = self.bot_action(data)
-        telegram_call(token, "answerCallbackQuery", {"callback_query_id": callback.get("id"), "text": answer[:190]})
+        self.telegram_send(token, "answerCallbackQuery",
+                           {"callback_query_id": callback.get("id"), "text": answer[:190]})
+        # Действие выполняется в потоке интерфейса, поэтому экран рисуется после него
+        self.stop.wait(0.7)
         accounts_screen = data == "accounts" or data.startswith("toggle:")
-        telegram_call(token, "editMessageText", {
+        self.telegram_send(token, "editMessageText", {
             "chat_id": chat, "message_id": message.get("message_id"),
             "text": self.accounts_text() if accounts_screen else self.bot_text(),
             "reply_markup": self.accounts_keyboard() if accounts_screen else self.bot_keyboard()})
@@ -912,7 +929,7 @@ class App:
         if text.startswith("/start") or text.startswith("/menu"):
             self.send_menu(token, chat)
             return
-        telegram_call(token, "sendMessage", {"chat_id": chat, "text": self.bot_command(text)})
+        self.telegram_send(token, "sendMessage", {"chat_id": chat, "text": self.bot_command(text)})
 
     def bot_command(self, text: str) -> str:
         """Выполняет команду чата и возвращает ответ"""
