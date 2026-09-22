@@ -1,10 +1,12 @@
 """Нативное приложение Shalost FOTUR для Windows и Linux"""
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 import queue
+import re
 import shutil
 import struct
 import subprocess
@@ -23,6 +25,8 @@ from playwright.sync_api import sync_playwright
 
 APP_NAME = "Shalost FOTUR"
 PULSE_HOME = "https://pulse.mirea.ru/"
+EDU_HOME = "https://online-edu.mirea.ru/"
+PRESENCE_TEXT = re.compile(r"подтверждаю", re.IGNORECASE)
 PULSE_RPC = "https://pulse.mirea.ru/rtu_tc.attendance.api.AttendanceService/SelfApproveAttendanceThroughQRCode"
 CLOUDTIPS_URL = "https://pay.cloudtips.ru/p/b58c4bc1"
 
@@ -263,6 +267,7 @@ class App:
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.stop = threading.Event()
         self.scanning = False
+        self.lecture = False
         self.browser_busy = False
         self.account = ""
         self.last_success = 0.0
@@ -383,6 +388,11 @@ class App:
         self.button(controls, text="Проверить сессию", style="Secondary.TButton", command=self.check_session).pack(side="left", padx=8)
         self.scan_button = self.button(controls, text="Начать сканирование", command=self.toggle_scan)
         self.scan_button.pack(side="left")
+        lecture_row = tk.Frame(state, bg=self.CARD)
+        lecture_row.pack(anchor="w", pady=(8, 0))
+        self.lecture_button = self.button(lecture_row, text="Открыть лекцию", style="Secondary.TButton", command=self.toggle_lecture)
+        self.lecture_button.pack(side="left")
+        self.label(lecture_row, "СДО и Pulse в одном окне", 9, color=self.MUTED).pack(side="left", padx=10)
         logs = self.card(self.main_page)
         logs.pack(fill="both", expand=True)
         self.label(logs, "Журнал работы", 11, True).pack(anchor="w")
@@ -485,6 +495,8 @@ class App:
                             self.login_button.pack(side="left")
                 elif kind == "scan":
                     self.scan_button.configure(text="Остановить сканирование" if value else "Начать сканирование")
+                elif kind == "lecture":
+                    self.lecture_button.configure(text="Закрыть лекцию" if value else "Открыть лекцию")
         except queue.Empty:
             pass
         if not self.stop.is_set():
@@ -587,6 +599,9 @@ class App:
             self.browser_busy = False
 
     def toggle_scan(self) -> None:
+        if self.lecture and not self.scanning:
+            self.post("status", "Работает режим лекции — сначала закройте его")
+            return
         if self.scanning:
             self.scanning = False
             self.stop.set()
@@ -603,6 +618,114 @@ class App:
         self.post("status", "Ищу QR на экранах…")
         self.log("SCAN", "Начат поиск QR на всех экранах (каждые 2 секунды)")
         threading.Thread(target=self.scan_worker, daemon=True).start()
+
+    def toggle_lecture(self) -> None:
+        """Открывает СДО и Pulse в одном окне браузера и следит за ними"""
+        if self.lecture:
+            self.lecture = False
+            self.post("lecture", False)
+            self.post("status", "Закрываю окно лекции…")
+            return
+        if self.scanning:
+            self.post("status", "Сначала остановите сканирование экрана")
+            return
+        if self.browser_busy:
+            self.post("status", "Уже выполняется проверка или вход…")
+            return
+        self.lecture = True
+        self.browser_busy = True
+        self.post("lecture", True)
+        self.post("status", "Открываю СДО и Pulse…")
+        threading.Thread(target=self.lecture_worker, daemon=True).start()
+
+    @staticmethod
+    def presence_button(page):
+        """Ищет кнопку подтверждения присутствия в любом кадре страницы"""
+        for frame in page.frames:
+            for locator in (frame.get_by_role("button", name=PRESENCE_TEXT), frame.get_by_text(PRESENCE_TEXT)):
+                try:
+                    if locator.count() and locator.first.is_visible():
+                        return locator.first
+                except PlaywrightError:
+                    continue
+        return None
+
+    def page_token(self, page) -> str | None:
+        """Ищет QR-код Pulse на снимке вкладки"""
+        import zxingcpp
+        from PIL import Image
+        with Image.open(io.BytesIO(page.screenshot(timeout=10000))) as image:
+            for code in zxingcpp.read_barcodes(image.convert("RGB")):
+                token = qr_token(code.text)
+                if token:
+                    return token
+        return None
+
+    def lecture_worker(self) -> None:
+        """Ведёт вкладки лекции: подтверждает присутствие и ловит QR прямо в браузере"""
+        confirmed_tokens: set[str] = set()
+        qr_successes = 0
+        try:
+            with sync_playwright() as p:
+                ctx = launch_context(p, headless=False)
+                pulse = ctx.pages[0] if ctx.pages else ctx.new_page()
+                pulse.goto(PULSE_HOME, wait_until="domcontentloaded", timeout=60000)
+                lecture = ctx.new_page()
+                lecture.goto(EDU_HOME, wait_until="domcontentloaded", timeout=60000)
+                self.log("LECTURE", "Открыты вкладки СДО и Pulse. Войдите и запустите лекцию в этом окне")
+                self.post("status", "Окно лекции открыто — следим за присутствием и QR")
+                while self.lecture and not self.stop.is_set():
+                    pages = [page for page in ctx.pages if not page.is_closed()]
+                    if not pages:
+                        self.log("LECTURE", "Окно лекции закрыто")
+                        break
+                    for page in pages:
+                        if page is pulse:
+                            continue
+                        try:
+                            button = self.presence_button(page)
+                            if button:
+                                button.click(timeout=5000)
+                                self.log("PRESENCE", "Присутствие в онлайн-мероприятии подтверждено")
+                                self.post("status", "Присутствие в онлайн-мероприятии подтверждено")
+                                continue
+                            if time.time() - self.last_success < int(self.settings["cooldown_minutes"]) * 60:
+                                continue
+                            token = self.page_token(page)
+                        except PlaywrightError:
+                            continue
+                        if not token or token in confirmed_tokens:
+                            continue
+                        attempt = qr_successes + 1
+                        self.log("SCAN", f"Найден новый QR Pulse во вкладке. Подтверждение {attempt}/3")
+                        ok, detail = self.approve_request(pulse, token)
+                        if ok:
+                            confirmed_tokens.add(token)
+                            qr_successes += 1
+                            if qr_successes == 3:
+                                self.last_success = time.time()
+                                confirmed_tokens.clear()
+                                qr_successes = 0
+                                self.log("PULSE", "Три разных QR подтверждены: 3/3. Включена пауза QR")
+                                self.post("status", "Посещение подтверждено: 3/3")
+                            else:
+                                self.log("PULSE", f"Новый QR подтверждён: {qr_successes}/3")
+                                self.post("status", f"Посещение подтверждено: {qr_successes}/3")
+                        else:
+                            confirmed_tokens.clear()
+                            qr_successes = 0
+                            self.log("PULSE", "Подтверждение отклонено: " + detail)
+                            self.post("status", "Ошибка Pulse: " + detail)
+                    self.stop.wait(2)
+                ctx.close()
+        except Exception as exc:
+            LOGGER.exception("Lecture mode failure")
+            self.log("LECTURE", "Режим лекции остановлен: " + self.short(exc))
+            self.post("status", "Режим лекции недоступен: " + self.short(exc))
+        finally:
+            self.lecture = False
+            self.browser_busy = False
+            self.post("lecture", False)
 
     def scan_worker(self) -> None:
         try:
@@ -741,6 +864,20 @@ class App:
             return
         self.log("PRESENCE", "Автоклик поддерживается только в Windows и Linux")
 
+    @staticmethod
+    def approve_request(page, token: str) -> tuple[bool, str]:
+        """Отправляет подтверждение QR со страницы Pulse, где уже есть Cookie сессии"""
+        result = page.evaluate("""async ({url, body}) => {
+          const r = await fetch(url, {method: 'POST', credentials: 'include', headers: {
+            'content-type': 'application/grpc-web+proto', 'x-grpc-web': '1',
+            'x-requested-with': 'XMLHttpRequest', 'pulse-app-type': 'pulse'}, body: Uint8Array.from(body)});
+          return {status:r.status, bytes:[...new Uint8Array(await r.arrayBuffer())]};
+        }""", {"url": PULSE_RPC, "body": list(grpc_body(token))})
+        grpc_status, grpc_message = grpc_web_trailer(bytes(result.get("bytes", [])))
+        if result.get("status") == 200 and grpc_status == "0":
+            return True, ""
+        return False, grpc_message or f"HTTP {result.get('status')}; gRPC {grpc_status or 'не указан'}"
+
     def approve(self, token: str) -> tuple[bool, str]:
         if self.browser_busy:
             return False, "завершите вход в Pulse"
@@ -749,18 +886,9 @@ class App:
                 ctx = launch_context(p, headless=True)
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 page.goto(PULSE_HOME, wait_until="domcontentloaded", timeout=60000)
-                result = page.evaluate("""async ({url, body}) => {
-                  const r = await fetch(url, {method: 'POST', credentials: 'include', headers: {
-                    'content-type': 'application/grpc-web+proto', 'x-grpc-web': '1',
-                    'x-requested-with': 'XMLHttpRequest', 'pulse-app-type': 'pulse'}, body: Uint8Array.from(body)});
-                  return {status:r.status, bytes:[...new Uint8Array(await r.arrayBuffer())]};
-                }""", {"url": PULSE_RPC, "body": list(grpc_body(token))})
+                answer = self.approve_request(page, token)
                 ctx.close()
-            grpc_status, grpc_message = grpc_web_trailer(bytes(result.get("bytes", [])))
-            if result.get("status") == 200 and grpc_status == "0":
-                return True, ""
-            detail = grpc_message or f"HTTP {result.get('status')}; gRPC {grpc_status or 'не указан'}"
-            return False, detail
+            return answer
         except Exception as exc:
             LOGGER.exception("Approval failure")
             return False, self.short(exc)
@@ -786,6 +914,7 @@ class App:
 
     def close(self) -> None:
         self.scanning = False
+        self.lecture = False
         self.stop.set()
         self.log("UI", "Приложение закрыто")
         self.root.after(100, self.root.destroy)
