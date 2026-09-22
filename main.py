@@ -7,12 +7,15 @@ import logging
 import os
 import queue
 import re
+import secrets
 import shutil
 import struct
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import tkinter as tk
 import webbrowser
 from pathlib import Path
@@ -106,6 +109,18 @@ LOGGER = logger()
 
 
 KEYRING_SERVICE = "Shalost FOTUR"
+TELEGRAM_KEY = "telegram-bot-token"
+TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
+NOTIFY_TAGS = ("PULSE", "PRESENCE", "AUTH", "LECTURE")
+
+
+def telegram_call(token: str, method: str, payload: dict | None = None, timeout: int = 40) -> dict:
+    """Вызов Bot API без сторонних библиотек"""
+    data = json.dumps(payload or {}).encode("utf-8")
+    request = urllib.request.Request(TELEGRAM_API.format(token=token, method=method), data=data,
+                                     headers={"content-type": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 def keyring_module():
@@ -164,7 +179,7 @@ def new_account(title: str) -> dict:
 
 def load_settings() -> dict:
     """Настройки вместе со списком аккаунтов; старые файлы дополняются аккаунтом по умолчанию"""
-    data = {"cooldown_minutes": 10, "accounts": [], "current": ""}
+    data = {"cooldown_minutes": 10, "accounts": [], "current": "", "telegram_chat": 0, "telegram_enabled": False}
     try:
         data.update(json.loads(SETTINGS_PATH.read_text(encoding="utf-8")))
     except (OSError, ValueError, TypeError):
@@ -352,6 +367,8 @@ class App:
         self.stop = threading.Event()
         self.scanning = False
         self.lecture = False
+        self.bot_running = False
+        self.pair_code = ""
         self.browser_busy = False
         self.account = ""
         self.last_success = 0.0
@@ -373,6 +390,8 @@ class App:
         LOGGER.info("Keyring backend: %s", store.get_keyring() if store else "недоступно")
         self.root.after(150, self.pump)
         self.root.after(1000, self.check_session)
+        if self.settings.get("telegram_enabled"):
+            self.start_bot()
 
     def set_icon(self) -> None:
         """Windows берёт значок из ICO, остальные системы — из PNG"""
@@ -445,6 +464,7 @@ class App:
         self.content = tk.Frame(outer, bg=self.BG)
         self.content.pack(fill="both", expand=True)
         self.main_page, self.settings_page = tk.Frame(self.content, bg=self.BG), tk.Frame(self.content, bg=self.BG)
+        self.settings_body = self.scrollable(self.settings_page)
         self.build_main()
         self.build_settings()
         footer = tk.Frame(outer, bg=self.BG)
@@ -489,8 +509,35 @@ class App:
         self.console.pack(fill="both", expand=True)
         self.console.configure(state="disabled")
 
+    def scrollable(self, parent):
+        """Возвращает прокручиваемую область: карточек настроек больше, чем высота окна"""
+        canvas = tk.Canvas(parent, bg=self.BG, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas, bg=self.BG)
+        window = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        inner.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
+        for sequence, step in (("<Button-4>", -1), ("<Button-5>", 1)):
+            canvas.bind_all(sequence, lambda _event, value=step: self.scroll_settings(canvas, value))
+        canvas.bind_all("<MouseWheel>", lambda event: self.scroll_settings(canvas, -1 if event.delta > 0 else 1))
+        return inner
+
+    def scroll_settings(self, canvas, step: int) -> None:
+        if self.settings_page.winfo_ismapped():
+            canvas.yview_scroll(step, "units")
+
+    def telegram_status(self) -> str:
+        if not self.settings.get("telegram_enabled"):
+            return "Бот не подключён"
+        if not self.settings.get("telegram_chat"):
+            return "Ожидаю команду /start " + (self.pair_code or "в приложении")
+        return f"Чат подключён: {self.settings['telegram_chat']}"
+
     def build_settings(self) -> None:
-        scan = self.card(self.settings_page)
+        scan = self.card(self.settings_body)
         scan.pack(fill="x", pady=(0, 10))
         self.label(scan, "Сканирование", 11, True).pack(anchor="w")
         self.label(scan, "Пауза после успешного подтверждения, минут.", 9, color=self.MUTED).pack(anchor="w", pady=(6, 5))
@@ -500,7 +547,7 @@ class App:
         self.entry(row, width=8, textvariable=self.cooldown).pack(side="left")
         self.label(row, "минут").pack(side="left", padx=8)
         self.button(row, text="Сохранить", command=self.save_cooldown).pack(side="left")
-        support = self.card(self.settings_page)
+        support = self.card(self.settings_body)
         support.pack(fill="x", pady=(0, 10))
         self.label(support, "Поддержка", 11, True).pack(anchor="w")
         support_row = tk.Frame(support, bg=self.CARD)
@@ -523,7 +570,7 @@ class App:
                 qr.bind("<Button-1>", lambda _event: webbrowser.open(CLOUDTIPS_URL))
             except (tk.TclError, ImportError):
                 LOGGER.exception("Donation QR cannot be loaded")
-        profile = self.card(self.settings_page)
+        profile = self.card(self.settings_body)
         profile.pack(fill="x")
         self.label(profile, "Аккаунты Pulse", 11, True).pack(anchor="w")
         self.label(profile, "Каждый аккаунт входит сам и хранит свою сессию.\nОтметка QR — аккаунт подтверждает найденный код.", 9, color=self.MUTED, justify="left").pack(anchor="w", pady=(6, 8))
@@ -535,6 +582,16 @@ class App:
         self.button(buttons, text="Копировать путь", style="Secondary.TButton", command=self.copy_profile).pack(side="left", padx=8)
         self.button(buttons, text=OPEN_FOLDER_TEXT, style="Secondary.TButton", command=self.open_profile).pack(side="left")
         self.draw_accounts()
+        telegram = self.card(self.settings_body)
+        telegram.pack(fill="x", pady=(10, 0))
+        self.label(telegram, "Управление из Telegram", 11, True).pack(anchor="w")
+        self.label(telegram, "Бот присылает события и понимает команды /status, /scan, /stop, /lecture, /close.", 9, color=self.MUTED).pack(anchor="w", pady=(6, 6))
+        self.telegram_label = self.label(telegram, self.telegram_status(), 9, True, "#cfe1ff")
+        self.telegram_label.pack(anchor="w")
+        telegram_row = tk.Frame(telegram, bg=self.CARD)
+        telegram_row.pack(anchor="w", pady=(8, 0))
+        self.button(telegram_row, text="Подключить бота", command=self.connect_bot).pack(side="left")
+        self.button(telegram_row, text="Отключить", style="Danger.TButton", command=self.disconnect_bot).pack(side="left", padx=8)
 
     def open_profile(self) -> None:
         """Открывает папку профиля активного аккаунта системным файловым менеджером"""
@@ -562,6 +619,8 @@ class App:
     def log(self, tag: str, message: str) -> None:
         LOGGER.info("[%s] %s", tag, message)
         self.events.put(("log", (tag, message)))
+        if tag in NOTIFY_TAGS:
+            self.notify(f"{tag}: {message}")
 
     def pump(self) -> None:
         try:
@@ -586,6 +645,8 @@ class App:
                             self.login_button.pack(side="left")
                 elif kind == "scan":
                     self.scan_button.configure(text="Остановить сканирование" if value else "Начать сканирование")
+                elif kind == "telegram":
+                    self.telegram_label.configure(text=self.telegram_status())
                 elif kind == "accounts":
                     self.draw_accounts()
                     enabled = len(self.enabled_accounts())
@@ -659,6 +720,142 @@ class App:
         self.save_settings()
         self.post("accounts", None)
         self.log("ACCOUNT", f"{account['title']}: {'участвует' if account['enabled'] else 'не участвует'} в подтверждении")
+
+    def notify(self, text: str) -> None:
+        """Отправляет сообщение в привязанный чат, не задерживая работу приложения"""
+        chat = self.settings.get("telegram_chat")
+        if not chat or not self.settings.get("telegram_enabled"):
+            return
+        token = load_password(TELEGRAM_KEY)
+        if not token:
+            return
+
+        def send() -> None:
+            try:
+                telegram_call(token, "sendMessage", {"chat_id": chat, "text": text}, timeout=15)
+            except (urllib.error.URLError, OSError, ValueError):
+                LOGGER.exception("Telegram message failed")
+
+        threading.Thread(target=send, daemon=True).start()
+
+    def start_bot(self) -> None:
+        if self.bot_running:
+            return
+        token = load_password(TELEGRAM_KEY)
+        if not token:
+            self.log("BOT", "Токен бота не сохранён")
+            return
+        self.bot_running = True
+        threading.Thread(target=self.bot_worker, args=(token,), daemon=True).start()
+
+    def bot_worker(self, token: str) -> None:
+        """Слушает команды Telegram длинным опросом"""
+        offset = 0
+        self.log("BOT", "Бот слушает команды")
+        while self.bot_running and not self.stop.is_set():
+            try:
+                answer = telegram_call(token, "getUpdates", {"timeout": 30, "offset": offset})
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                self.log("BOT", "Связь с Telegram потеряна: " + self.short(exc))
+                self.stop.wait(10)
+                continue
+            for update in answer.get("result", []):
+                offset = update.get("update_id", 0) + 1
+                try:
+                    self.handle_update(token, update)
+                except Exception:
+                    LOGGER.exception("Telegram update failed")
+        self.bot_running = False
+        self.log("BOT", "Бот остановлен")
+
+    def handle_update(self, token: str, update: dict) -> None:
+        """Привязывает чат по коду и отвечает на команды только привязанному чату"""
+        message = update.get("message") or {}
+        chat = (message.get("chat") or {}).get("id")
+        text = (message.get("text") or "").strip()
+        if not chat or not text:
+            return
+        known = self.settings.get("telegram_chat")
+        if not known:
+            if self.pair_code and text.startswith("/start") and self.pair_code in text:
+                self.settings["telegram_chat"] = chat
+                self.settings["telegram_enabled"] = True
+                self.pair_code = ""
+                self.save_settings()
+                self.post("telegram", None)
+                self.log("BOT", "Чат привязан, команды доступны")
+                telegram_call(token, "sendMessage", {"chat_id": chat, "text": self.bot_command("/help")})
+            return
+        if chat != known:
+            return
+        telegram_call(token, "sendMessage", {"chat_id": chat, "text": self.bot_command(text)})
+
+    def bot_command(self, text: str) -> str:
+        """Выполняет команду чата и возвращает ответ"""
+        command = text.split()[0].lower().split("@")[0]
+        if command == "/status":
+            logged = [item["title"] for item in self.settings["accounts"] if item["name"]]
+            lines = [f"Аккаунтов: {len(self.settings['accounts'])}, вошли: {len(logged) or 0}",
+                     "Подтверждают QR: " + ", ".join(item["title"] for item in self.enabled_accounts()),
+                     "Поиск QR на экранах: " + ("идёт" if self.scanning else "остановлен"),
+                     "Режим лекции: " + ("открыт" if self.lecture else "закрыт")]
+            return "\n".join(lines)
+        if command == "/scan":
+            if self.scanning:
+                return "Поиск QR уже идёт"
+            self.root.after(0, self.toggle_scan)
+            return "Запускаю поиск QR на экранах"
+        if command == "/stop":
+            if not self.scanning:
+                return "Поиск QR не запущен"
+            self.root.after(0, self.toggle_scan)
+            return "Останавливаю поиск QR"
+        if command == "/lecture":
+            if self.lecture:
+                return "Окно лекции уже открыто"
+            self.root.after(0, self.toggle_lecture)
+            return "Открываю СДО и Pulse"
+        if command == "/close":
+            if not self.lecture:
+                return "Окно лекции не открыто"
+            self.root.after(0, self.toggle_lecture)
+            return "Закрываю окно лекции"
+        return ("Команды:\n/status — что сейчас происходит\n/scan — начать поиск QR\n"
+                "/stop — остановить поиск\n/lecture — открыть СДО и Pulse\n/close — закрыть окно лекции")
+
+    def connect_bot(self) -> None:
+        """Сохраняет токен бота и ждёт команду привязки чата"""
+        if not keyring_module():
+            messagebox.showinfo(APP_NAME, "Системное хранилище паролей недоступно, токен бота сохранить негде")
+            return
+        token = simpledialog.askstring(APP_NAME, "Токен бота от @BotFather", parent=self.root)
+        if token is None:
+            return
+        token = token.strip()
+        if not token:
+            return
+        if not save_password(TELEGRAM_KEY, token):
+            messagebox.showerror(APP_NAME, "Не удалось сохранить токен в системном хранилище")
+            return
+        self.settings["telegram_chat"] = 0
+        self.settings["telegram_enabled"] = True
+        self.save_settings()
+        self.pair_code = f"{secrets.randbelow(1000000):06d}"
+        self.bot_running = False
+        self.root.after(1500, self.start_bot)
+        self.post("telegram", None)
+        self.log("BOT", "Отправьте боту команду /start " + self.pair_code)
+        messagebox.showinfo(APP_NAME, "Откройте своего бота в Telegram и отправьте ему:\n\n/start " + self.pair_code)
+
+    def disconnect_bot(self) -> None:
+        self.bot_running = False
+        self.pair_code = ""
+        self.settings["telegram_chat"] = 0
+        self.settings["telegram_enabled"] = False
+        self.save_settings()
+        forget_password(TELEGRAM_KEY)
+        self.post("telegram", None)
+        self.log("BOT", "Телеграм отключён")
 
     def edit_credentials(self, account: dict) -> None:
         """Сохраняет логин и пароль аккаунта в системном хранилище"""
@@ -1261,6 +1458,7 @@ class App:
     def close(self) -> None:
         self.scanning = False
         self.lecture = False
+        self.bot_running = False
         self.stop.set()
         self.log("UI", "Приложение закрыто")
         self.root.after(100, self.root.destroy)
