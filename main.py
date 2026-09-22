@@ -375,6 +375,7 @@ class App:
         self.bot_running = False
         self.bot_thread: threading.Thread | None = None
         self.code_answer: queue.Queue | None = None
+        self.login_attempts: dict[str, float] = {}
         self.code_window = None
         self.pair_code = ""
         self.browser_busy = False
@@ -828,6 +829,15 @@ class App:
                      "Режим лекции: " + ("открыт" if self.lecture else "закрыт"),
                      "Ссылка занятия: " + (self.settings.get("lecture_url") or "не задана")]
             return "\n".join(lines)
+        if command == "/login":
+            pending = [item["title"] for item in self.settings["accounts"] if self.needs_login(item)]
+            if self.browser_busy:
+                return "Браузер сейчас занят, попробуйте через минуту"
+            self.root.after(0, self.check_session)
+            if not pending:
+                return "Проверяю сессии. Аккаунтов с сохранённым паролем и без входа нет"
+            self.login_attempts.clear()
+            return "Вхожу в аккаунты: " + ", ".join(pending)
         if command == "/scan":
             if self.scanning:
                 return "Поиск QR уже идёт"
@@ -859,7 +869,8 @@ class App:
                 return "Окно лекции не открыто"
             self.root.after(0, self.toggle_lecture)
             return "Закрываю окно лекции"
-        return ("Команды:\n/status — что сейчас происходит\n/scan — начать поиск QR\n"
+        return ("Команды:\n/status — что сейчас происходит\n/login — проверить сессии и войти\n"
+                "/scan — начать поиск QR\n"
                 "/stop — остановить поиск\n/lecture — открыть занятие\n"
                 "/lecture <ссылка> — запомнить ссылку и открыть её\n/close — закрыть окно лекции")
 
@@ -1018,6 +1029,9 @@ class App:
                         continue
                     account["name"] = name if logged else ""
                     self.log("AUTH", f"{account['title']}: " + (f"сессия активна, {name}" if logged else "вход не выполнен"))
+                for account in self.settings["accounts"]:
+                    if self.needs_login(account):
+                        self.relogin(p, account)
             self.save_settings()
             self.post("accounts", None)
             self.post("account", self.current_account()["name"])
@@ -1025,6 +1039,49 @@ class App:
             self.post("status", f"Сессий активно: {len(logged_in)} из {len(self.settings['accounts'])}" if logged_in else "Войдите в Pulse")
         finally:
             self.browser_busy = False
+
+    def needs_login(self, account: dict) -> bool:
+        """Сессии нет, но есть сохранённые данные для входа"""
+        return not account["name"] and bool(account.get("login")) and bool(load_password(account["id"]))
+
+    def relogin(self, playwright, account: dict) -> bool:
+        """Восстанавливает сессию без участия человека за компьютером
+
+        Окно браузера не открывается: пароль берётся из хранилища, а код 2FA
+        приходит из Telegram или из окна приложения.
+        """
+        if time.time() - self.login_attempts.get(account["id"], 0) < 600:
+            return False
+        self.login_attempts[account["id"]] = time.time()
+        self.log("AUTH", f"{account['title']}: сессии нет, вхожу с сохранённым паролем")
+        try:
+            ctx = launch_context(playwright, headless=True, profile=profile_path(account["id"]))
+        except PlaywrightError as exc:
+            self.log("AUTH", f"{account['title']}: браузер не запустился — " + self.short(exc))
+            return False
+        try:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            page.goto(PULSE_HOME, wait_until="domcontentloaded", timeout=60000)
+            self.autologin(page, account)
+            for _ in range(90):
+                if self.stop.wait(1):
+                    break
+                try:
+                    state = page.evaluate(STATE_JS)
+                except PlaywrightError:
+                    continue
+                name = str(state.get("name", "")).strip()
+                if name and state.get("onPulse"):
+                    account["name"] = name
+                    self.save_settings()
+                    self.post("accounts", None)
+                    self.post("account", name)
+                    self.log("AUTH", f"{account['title']}: вход выполнен автоматически, {name}")
+                    return True
+            self.log("AUTH", f"{account['title']}: автоматический вход не удался, войдите вручную")
+            return False
+        finally:
+            ctx.close()
 
     def open_login(self) -> None:
         if self.browser_busy:
