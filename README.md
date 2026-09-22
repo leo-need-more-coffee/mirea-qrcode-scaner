@@ -139,6 +139,23 @@ AppImage собирается из готовой папки `dist/Shalost-FOTUR
 
 После push тега вида `v0.1.0` тот же сценарий публикует релиз: установщик и ZIP для Windows, tar.gz и AppImage для Linux.
 
+## Устройство проекта
+
+    main.py              точка входа
+    shalost/paths.py     пути приложения и журнал
+    shalost/settings.py  настройки и список аккаунтов
+    shalost/passwords.py пароли и токены в системном хранилище
+    shalost/pulse.py     разбор QR и подтверждение присутствия
+    shalost/browser.py   запуск профиля Chrome и поиск элементов на страницах
+    shalost/login.py     вход сохранёнными данными, включая код 2FA
+    shalost/screen.py    снимок экранов и клик по точке рабочего стола
+    shalost/telegram.py  бот: уведомления, команды и кнопки
+    shalost/ui.py        окно приложения и сценарии работы
+    tests/               тесты на локальных страницах-заглушках
+
+Тесты запускаются командой `python -m pytest`; те, которым нужен браузер,
+пропускаются, если его нет в системе. Подробности — в [CONTRIBUTING](CONTRIBUTING.md).
+
 ## Лицензия
 
 [MIT](LICENSE). Оригинальный проект — [Woonze/Shalost_MIREA](https://github.com/Woonze/Shalost_MIREA).

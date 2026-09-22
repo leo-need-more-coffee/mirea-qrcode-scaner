@@ -25,3 +25,7 @@ pulseqr-settings.json
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Локальное окружение и кеши
+.venv/
+.pytest_cache/
