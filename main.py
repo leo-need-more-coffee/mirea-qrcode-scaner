@@ -179,7 +179,8 @@ def new_account(title: str) -> dict:
 
 def load_settings() -> dict:
     """Настройки вместе со списком аккаунтов; старые файлы дополняются аккаунтом по умолчанию"""
-    data = {"cooldown_minutes": 10, "accounts": [], "current": "", "telegram_chat": 0, "telegram_enabled": False}
+    data = {"cooldown_minutes": 10, "accounts": [], "current": "", "telegram_chat": 0,
+            "telegram_enabled": False, "lecture_url": ""}
     try:
         data.update(json.loads(SETTINGS_PATH.read_text(encoding="utf-8")))
     except (OSError, ValueError, TypeError):
@@ -338,6 +339,10 @@ def launch_context(playwright, headless: bool, profile: Path):
     поэтому запасным вариантом идёт найденный в PATH браузер.
     """
     profile.mkdir(parents=True, exist_ok=True)
+    # Без этих флагов Chrome замедляет таймеры в фоновых вкладках,
+    # и окно «Контроль присутствия» появляется с большой задержкой
+    args = ["--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding"]
     attempts: list[dict] = [{"channel": "chrome"}]
     executable = system_browser()
     if executable:
@@ -346,7 +351,7 @@ def launch_context(playwright, headless: bool, profile: Path):
     failure = None
     for options in attempts:
         try:
-            context = playwright.chromium.launch_persistent_context(str(profile), headless=headless, **options)
+            context = playwright.chromium.launch_persistent_context(str(profile), headless=headless, args=args, **options)
             LOGGER.info("Browser started with %s", options)
             return context
         except PlaywrightError as exc:
@@ -547,6 +552,15 @@ class App:
         self.entry(row, width=8, textvariable=self.cooldown).pack(side="left")
         self.label(row, "минут").pack(side="left", padx=8)
         self.button(row, text="Сохранить", command=self.save_cooldown).pack(side="left")
+        lecture = self.card(self.settings_body)
+        lecture.pack(fill="x", pady=(0, 10))
+        self.label(lecture, "Ссылка на занятие", 11, True).pack(anchor="w")
+        self.label(lecture, "Откроется вкладкой рядом с Pulse: QR и кнопка присутствия ищутся прямо в ней,\nпоэтому снимки экрана не нужны.", 9, color=self.MUTED, justify="left").pack(anchor="w", pady=(6, 5))
+        lecture_row = tk.Frame(lecture, bg=self.CARD)
+        lecture_row.pack(anchor="w", fill="x")
+        self.lecture_link = tk.StringVar(value=self.settings.get("lecture_url", ""))
+        self.entry(lecture_row, textvariable=self.lecture_link).pack(side="left", fill="x", expand=True)
+        self.button(lecture_row, text="Сохранить", command=self.save_lecture_link).pack(side="left", padx=8)
         support = self.card(self.settings_body)
         support.pack(fill="x", pady=(0, 10))
         self.label(support, "Поддержка", 11, True).pack(anchor="w")
@@ -798,7 +812,8 @@ class App:
             lines = [f"Аккаунтов: {len(self.settings['accounts'])}, вошли: {len(logged) or 0}",
                      "Подтверждают QR: " + ", ".join(item["title"] for item in self.enabled_accounts()),
                      "Поиск QR на экранах: " + ("идёт" if self.scanning else "остановлен"),
-                     "Режим лекции: " + ("открыт" if self.lecture else "закрыт")]
+                     "Режим лекции: " + ("открыт" if self.lecture else "закрыт"),
+                     "Ссылка занятия: " + (self.settings.get("lecture_url") or "не задана")]
             return "\n".join(lines)
         if command == "/scan":
             if self.scanning:
@@ -811,17 +826,29 @@ class App:
             self.root.after(0, self.toggle_scan)
             return "Останавливаю поиск QR"
         if command == "/lecture":
+            parts = text.split(maxsplit=1)
+            if len(parts) > 1:
+                link = parts[1].strip()
+                if not link.startswith(("http://", "https://")):
+                    return "Ссылка должна начинаться с http:// или https://"
+                self.settings["lecture_url"] = link
+                self.save_settings()
+                self.root.after(0, lambda: self.lecture_link.set(link))
+                if self.lecture:
+                    return "Ссылка сохранена. Закройте окно командой /close и откройте заново"
             if self.lecture:
                 return "Окно лекции уже открыто"
             self.root.after(0, self.toggle_lecture)
-            return "Открываю СДО и Pulse"
+            link = self.settings.get("lecture_url", "")
+            return "Открываю занятие: " + link if link else "Открываю СДО и Pulse"
         if command == "/close":
             if not self.lecture:
                 return "Окно лекции не открыто"
             self.root.after(0, self.toggle_lecture)
             return "Закрываю окно лекции"
         return ("Команды:\n/status — что сейчас происходит\n/scan — начать поиск QR\n"
-                "/stop — остановить поиск\n/lecture — открыть СДО и Pulse\n/close — закрыть окно лекции")
+                "/stop — остановить поиск\n/lecture — открыть занятие\n"
+                "/lecture <ссылка> — запомнить ссылку и открыть её\n/close — закрыть окно лекции")
 
     def connect_bot(self) -> None:
         """Сохраняет токен бота и ждёт команду привязки чата"""
@@ -928,6 +955,16 @@ class App:
         self.settings["cooldown_minutes"] = minutes
         self.save_settings()
         self.log("SETTINGS", f"Пауза после успеха: {minutes} мин.")
+        self.post("status", "Настройки сохранены")
+
+    def save_lecture_link(self) -> None:
+        link = self.lecture_link.get().strip()
+        if link and not link.startswith(("http://", "https://")):
+            messagebox.showerror(APP_NAME, "Ссылка должна начинаться с http:// или https://")
+            return
+        self.settings["lecture_url"] = link
+        self.save_settings()
+        self.log("LECTURE", "Ссылка занятия сохранена" if link else "Ссылка занятия очищена")
         self.post("status", "Настройки сохранены")
 
     def copy_profile(self) -> None:
@@ -1149,6 +1186,24 @@ class App:
                     continue
         return None
 
+    def press_presence(self, button) -> bool:
+        """Нажимает кнопку присутствия
+
+        В неактивной вкладке Chrome не доставляет настоящие события мыши,
+        поэтому запасной вариант — событие click из самой страницы.
+        """
+        try:
+            button.click(timeout=3000)
+            return True
+        except PlaywrightError:
+            LOGGER.info("Presence button click timed out, falling back to DOM event")
+        try:
+            button.dispatch_event("click")
+            return True
+        except PlaywrightError as exc:
+            self.log("PRESENCE", "Не удалось нажать кнопку подтверждения: " + self.short(exc))
+            return False
+
     def page_token(self, page) -> str | None:
         """Ищет QR-код Pulse на снимке вкладки"""
         import zxingcpp
@@ -1192,6 +1247,13 @@ class App:
                 lecture = ctx.new_page()
                 lecture.goto(EDU_HOME, wait_until="domcontentloaded", timeout=60000)
                 self.log("LECTURE", "Открыты вкладки СДО и Pulse. Войдите и запустите лекцию в этом окне")
+                link = self.settings.get("lecture_url", "").strip()
+                if link:
+                    try:
+                        ctx.new_page().goto(link, wait_until="domcontentloaded", timeout=60000)
+                        self.log("LECTURE", "Открыта сохранённая ссылка занятия")
+                    except PlaywrightError as exc:
+                        self.log("LECTURE", "Ссылка занятия не открылась: " + self.short(exc))
                 self.post("status", "Окно лекции открыто — следим за присутствием и QR")
                 while self.lecture and not self.stop.is_set():
                     pages = [page for page in ctx.pages if not page.is_closed()]
@@ -1204,14 +1266,15 @@ class App:
                         try:
                             button = self.presence_button(page)
                             if button:
-                                button.click(timeout=5000)
-                                self.log("PRESENCE", "Присутствие в онлайн-мероприятии подтверждено")
-                                self.post("status", "Присутствие в онлайн-мероприятии подтверждено")
+                                if self.press_presence(button):
+                                    self.log("PRESENCE", "Присутствие в онлайн-мероприятии подтверждено")
+                                    self.post("status", "Присутствие в онлайн-мероприятии подтверждено")
                                 continue
                             if time.time() - self.last_success < int(self.settings["cooldown_minutes"]) * 60:
                                 continue
                             token = self.page_token(page)
-                        except PlaywrightError:
+                        except PlaywrightError as exc:
+                            LOGGER.info("Page skipped: %s", exc)
                             continue
                         if not token or token in confirmed_tokens:
                             continue
