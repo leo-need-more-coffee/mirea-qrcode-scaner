@@ -373,6 +373,7 @@ class App:
         self.scanning = False
         self.lecture = False
         self.bot_running = False
+        self.bot_thread: threading.Thread | None = None
         self.pair_code = ""
         self.browser_busy = False
         self.account = ""
@@ -753,22 +754,51 @@ class App:
         threading.Thread(target=send, daemon=True).start()
 
     def start_bot(self) -> None:
-        if self.bot_running:
-            return
+        """Запускает бота в единственном экземпляре: два опроса одним токеном дают ошибку 409"""
         token = load_password(TELEGRAM_KEY)
         if not token:
             self.log("BOT", "Токен бота не сохранён")
             return
+        threading.Thread(target=self.restart_bot, args=(token,), daemon=True).start()
+
+    def restart_bot(self, token: str) -> None:
+        previous = self.bot_thread
+        self.bot_running = False
+        if previous and previous.is_alive():
+            previous.join(timeout=60)
+        self.bot_thread = threading.current_thread()
         self.bot_running = True
-        threading.Thread(target=self.bot_worker, args=(token,), daemon=True).start()
+        self.bot_worker(token)
+
+    def bot_alive(self) -> bool:
+        return self.bot_running and self.bot_thread is threading.current_thread() and not self.stop.is_set()
 
     def bot_worker(self, token: str) -> None:
         """Слушает команды Telegram длинным опросом"""
         offset = 0
+        conflict_at = 0.0
+        try:
+            # Вебхук и опрос вместе не работают, поэтому вебхук снимается
+            telegram_call(token, "deleteWebhook", {"drop_pending_updates": False}, timeout=15)
+        except (urllib.error.URLError, OSError, ValueError):
+            LOGGER.info("deleteWebhook failed")
         self.log("BOT", "Бот слушает команды")
-        while self.bot_running and not self.stop.is_set():
+        while self.bot_alive():
             try:
-                answer = telegram_call(token, "getUpdates", {"timeout": 30, "offset": offset})
+                answer = telegram_call(token, "getUpdates", {"timeout": 25, "offset": offset})
+            except urllib.error.HTTPError as exc:
+                if exc.code == 409:
+                    if time.time() - conflict_at > 60:
+                        conflict_at = time.time()
+                        self.log("BOT", "Этот бот уже опрашивается другой программой, жду освобождения")
+                    self.stop.wait(15)
+                    continue
+                if exc.code == 401:
+                    self.log("BOT", "Telegram не принял токен, подключите бота заново")
+                    break
+                self.log("BOT", "Telegram ответил ошибкой: " + self.short(exc))
+                self.stop.wait(10)
+                continue
             except (urllib.error.URLError, OSError, ValueError) as exc:
                 self.log("BOT", "Связь с Telegram потеряна: " + self.short(exc))
                 self.stop.wait(10)
@@ -779,8 +809,10 @@ class App:
                     self.handle_update(token, update)
                 except Exception:
                     LOGGER.exception("Telegram update failed")
-        self.bot_running = False
-        self.log("BOT", "Бот остановлен")
+        if self.bot_thread is threading.current_thread():
+            self.bot_running = False
+            self.bot_thread = None
+            self.log("BOT", "Бот остановлен")
 
     def handle_update(self, token: str, update: dict) -> None:
         """Привязывает чат по коду и отвечает на команды только привязанному чату"""
@@ -868,11 +900,24 @@ class App:
         self.settings["telegram_enabled"] = True
         self.save_settings()
         self.pair_code = f"{secrets.randbelow(1000000):06d}"
-        self.bot_running = False
-        self.root.after(1500, self.start_bot)
+        self.start_bot()
         self.post("telegram", None)
         self.log("BOT", "Отправьте боту команду /start " + self.pair_code)
+        threading.Thread(target=self.check_bot_token, args=(token,), daemon=True).start()
         messagebox.showinfo(APP_NAME, "Откройте своего бота в Telegram и отправьте ему:\n\n/start " + self.pair_code)
+
+    def check_bot_token(self, token: str) -> None:
+        """Показывает имя бота, чтобы сразу было видно, принят ли токен"""
+        try:
+            answer = telegram_call(token, "getMe", timeout=15)
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            self.log("BOT", "Проверить токен не удалось: " + self.short(exc))
+            return
+        username = (answer.get("result") or {}).get("username", "")
+        if username:
+            self.log("BOT", f"Бот @{username} на связи, отправьте ему /start {self.pair_code}")
+        else:
+            self.log("BOT", "Telegram не принял токен")
 
     def disconnect_bot(self) -> None:
         self.bot_running = False
