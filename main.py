@@ -773,7 +773,8 @@ class App:
         self.log("BOT", "Бот слушает команды")
         while self.bot_alive():
             try:
-                answer = telegram_call(token, "getUpdates", {"timeout": 25, "offset": offset})
+                answer = telegram_call(token, "getUpdates", {"timeout": 25, "offset": offset,
+                                                            "allowed_updates": ["message", "callback_query"]})
             except urllib.error.HTTPError as exc:
                 if exc.code == 409:
                     if time.time() - conflict_at > 60:
@@ -872,8 +873,10 @@ class App:
         message = callback.get("message") or {}
         chat = (message.get("chat") or {}).get("id")
         if chat != self.settings.get("telegram_chat"):
+            LOGGER.info("Callback from unknown chat %s", chat)
             return
         data = callback.get("data", "")
+        LOGGER.info("Callback %s from chat %s", data, chat)
         answer = self.bot_action(data)
         telegram_call(token, "answerCallbackQuery", {"callback_query_id": callback.get("id"), "text": answer[:190]})
         accounts_screen = data == "accounts" or data.startswith("toggle:")
@@ -884,6 +887,7 @@ class App:
 
     def handle_update(self, token: str, update: dict) -> None:
         """Привязывает чат по коду и отвечает только привязанному чату"""
+        LOGGER.info("Telegram update: %s", ", ".join(key for key in update if key != "update_id"))
         if update.get("callback_query"):
             self.handle_callback(token, update["callback_query"])
             return
