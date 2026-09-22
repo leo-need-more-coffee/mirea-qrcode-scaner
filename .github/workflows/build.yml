@@ -81,18 +81,29 @@ jobs:
         if: matrix.system == 'windows'
         shell: pwsh
         run: |
-          Start-Process -FilePath dist/Shalost-FOTUR/Shalost-FOTUR.exe
-          foreach ($attempt in 1..40) {
-            if ((Test-Path dist/Shalost-FOTUR/pulseqr.log) -and
-                (Select-String -Path dist/Shalost-FOTUR/pulseqr.log -Pattern "Интерфейс готов" -Quiet)) { break }
+          $log = "dist/Shalost-FOTUR/pulseqr.log"
+          $app = Start-Process -FilePath dist/Shalost-FOTUR/Shalost-FOTUR.exe -PassThru
+          # Первый запуск собранного приложения тормозит проверка Defender, поэтому ждём долго
+          foreach ($attempt in 1..120) {
+            if ((Test-Path $log) -and (Select-String -Path $log -Pattern "Интерфейс готов" -Quiet)) { break }
+            if ($app.HasExited) {
+              Write-Host "Процесс завершился с кодом $($app.ExitCode) через $attempt с"
+              break
+            }
             Start-Sleep -Seconds 1
           }
           Stop-Process -Name Shalost-FOTUR -Force -ErrorAction SilentlyContinue
-          Get-Content dist/Shalost-FOTUR/pulseqr.log
-          if (-not (Select-String -Path dist/Shalost-FOTUR/pulseqr.log -Pattern "Интерфейс готов" -Quiet)) {
+          if (Test-Path $log) {
+            Get-Content $log
+          } else {
+            Write-Host "Журнал не создан. Содержимое папки:"
+            Get-ChildItem dist/Shalost-FOTUR | Select-Object -First 15 Name, Length | Format-Table
             throw "Приложение не запустилось"
           }
-          Remove-Item dist/Shalost-FOTUR/pulseqr.log -Force
+          if (-not (Select-String -Path $log -Pattern "Интерфейс готов" -Quiet)) {
+            throw "Приложение запустилось, но интерфейс не открылся"
+          }
+          Remove-Item $log -Force
 
       - name: Портативная сборка для Linux
         if: matrix.system == 'linux'
