@@ -394,6 +394,10 @@ class App:
         self.root.after(150, self.pump)
         self.root.after(1000, self.check_session)
         if self.settings.get("telegram_enabled"):
+            if not self.settings.get("telegram_chat"):
+                # Код привязки живёт только в памяти, после перезапуска нужен новый
+                self.pair_code = f"{secrets.randbelow(1000000):06d}"
+                self.log("BOT", "Отправьте боту команду /start " + self.pair_code)
             self.start_bot()
 
     def set_icon(self) -> None:
