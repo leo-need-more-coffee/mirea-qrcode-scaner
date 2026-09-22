@@ -1,6 +1,6 @@
 # Shalost FOTUR
 
-Локальное Windows-приложение для работы со своим аккаунтом Pulse РТУ МИРЭА: вход через официальный сайт, поиск QR-кодов на экранах и отправка подтверждения присутствия.
+Локальное приложение для Windows и Linux для работы со своим аккаунтом Pulse РТУ МИРЭА: вход через официальный сайт, поиск QR-кодов на экранах и отправка подтверждения присутствия.
 
 > Проект не связан с РТУ МИРЭА и Pulse. Используйте его только для собственного аккаунта и в соответствии с правилами учебного заведения.
 
@@ -18,7 +18,7 @@
 - В настройках есть путь к профилю, открытие папки, копирование пути и безопасный выход из аккаунта.
 - Добавлены ссылки на FOTUR VPN и CloudTips QR.
 
-## Установка и первый вход
+## Установка и первый вход в Windows
 
 Нужен Windows 10/11 и установленный Google Chrome.
 
@@ -32,11 +32,27 @@
 
 Cookie вручную копировать не нужно. Если Chrome или Pulse вернул ошибку, откройте нижний журнал: статус и причина остаются видны, а поиск QR продолжится.
 
+## Установка и первый вход в Linux
+
+Нужен x86-64 дистрибутив с glibc 2.35 или новее и установленный Google Chrome либо Chromium: приложение берёт первый найденный браузер из PATH.
+
+1. Скачайте сборку из Releases:
+   - Shalost-FOTUR-x86_64.AppImage — один файл, `chmod +x` и запуск;
+   - Shalost-FOTUR-linux-x86_64.tar.gz — portable-вариант. Распакуйте архив и запустите `./Shalost-FOTUR` либо `./install.sh` для ярлыка в меню приложений.
+2. Дальше всё как в Windows: «Войти в Pulse», вход и 2FA в открывшемся окне браузера.
+
+Если AppImage не запускается из-за отсутствия FUSE, используйте `./Shalost-FOTUR-x86_64.AppImage --appimage-extract-and-run`.
+
+### Снимки экрана и автоклик
+
+Поиск QR на всех экранах — она нужна для QR с проектора в аудитории. Снимок экрана и автоклик выполняются через X11, поэтому в сеансе Wayland они недоступны: войдите в сеанс X11. Приложение пишет об этом в журнал. Для автоклика достаточно системных библиотек X11 и XTEST, при их отсутствии используется `xdotool`.
+
 ## Сессия и приватность
 
 Сессия хранится только в профиле Chrome:
 
-    %LOCALAPPDATA%\Shalost\pulse-chrome-profile
+    %LOCALAPPDATA%\Shalost\pulse-chrome-profile      (Windows)
+    ~/.local/share/Shalost/pulse-chrome-profile       (Linux)
 
 Не передавайте содержимое этой папки: в нём могут быть данные авторизации. Кнопка «Выйти» удаляет этот профиль и требует войти заново. Срок жизни сессии определяется сервером Pulse; приложение не может его продлить и проверяет сессию при старте.
 
@@ -44,8 +60,9 @@ Cookie вручную копировать не нужно. Если Chrome ил
 
 В интерфейсе выводятся только рабочие события UI, AUTH, SCAN и PULSE. Полная диагностика сохраняется в файле `pulseqr.log`:
 
-- в portable-версии — рядом с `Shalost-FOTUR.exe`;
-- в установленной версии — в `%LOCALAPPDATA%\Shalost\pulseqr.log`.
+- в portable-версии — рядом с `Shalost-FOTUR.exe` или `Shalost-FOTUR`;
+- в установленной версии — в `%LOCALAPPDATA%\Shalost\pulseqr.log` на Windows и в `~/.local/share/Shalost/pulseqr.log` на Linux;
+- в AppImage — всегда в `~/.local/share/Shalost/pulseqr.log`, потому что сам образ доступен только для чтения.
 
 Это позволяет не засорять экран техническими ошибками, но сохраняет данные для отладки. Установленная версия не пытается записывать журналы в `Program Files`.
 
@@ -57,6 +74,17 @@ Cookie вручную копировать не нужно. Если Chrome ил
     pyinstaller --noconfirm --clean --onedir --windowed --exclude-module numpy --icon assets/shalost-fotur.ico --add-data "assets/cloudtips-donation-qr.png;assets" --add-data "assets/shalost-fotur.ico;assets" --add-data "assets/shalost-fotur.png;assets" --name Shalost-FOTUR main.py
 
 Готовая portable-папка появится в dist\Shalost-FOTUR. Сценарий GitHub Actions автоматически создаёт и portable ZIP, и обычный установщик после push тега вида v0.1.0.
+
+Сборка в Linux отличается разделителем в `--add-data` и не использует значок ICO:
+
+    python -m pip install -r requirements.txt pyinstaller
+    pyinstaller --noconfirm --clean --onedir --exclude-module numpy --hidden-import PIL._tkinter_finder --add-data "assets/cloudtips-donation-qr.png:assets" --add-data "assets/shalost-fotur.ico:assets" --add-data "assets/shalost-fotur.png:assets" --name Shalost-FOTUR main.py
+
+AppImage собирается из готовой папки `dist/Shalost-FOTUR`:
+
+    APPIMAGETOOL=/путь/к/appimagetool packaging/linux/build-appimage.sh
+
+Сценарий GitHub Actions `build-linux.yml` делает то же самое и публикует tar.gz и AppImage после push тега вида v0.1.0.
 
 ## Лицензия
 

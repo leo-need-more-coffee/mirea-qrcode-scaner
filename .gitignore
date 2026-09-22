@@ -9,8 +9,10 @@ dist/
 build-*/
 diagnostic/
 release/
+releases/
 *.spec
 *.exe
+*.AppImage
 
 # Local application data and secrets
 *.log

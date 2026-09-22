@@ -1,0 +1,69 @@
+name: Build Linux application
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-tk libx11-6 libxtst6 xdotool
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pyinstaller
+      - name: Build portable application
+        run: >
+          pyinstaller --noconfirm --clean --onedir --exclude-module numpy
+          --hidden-import PIL._tkinter_finder
+          --add-data "assets/cloudtips-donation-qr.png:assets"
+          --add-data "assets/shalost-fotur.ico:assets"
+          --add-data "assets/shalost-fotur.png:assets"
+          --name Shalost-FOTUR main.py
+      - name: Smoke test build
+        run: |
+          sudo apt-get install -y --no-install-recommends xvfb
+          xvfb-run -a dist/Shalost-FOTUR/Shalost-FOTUR &
+          for _ in $(seq 40); do
+            grep -q "Интерфейс готов" dist/Shalost-FOTUR/pulseqr.log 2>/dev/null && break
+            sleep 1
+          done
+          pkill -x Shalost-FOTUR || true
+          cat dist/Shalost-FOTUR/pulseqr.log
+          grep -q "Интерфейс готов" dist/Shalost-FOTUR/pulseqr.log
+          rm -f dist/Shalost-FOTUR/pulseqr.log
+      - name: Package portable edition
+        run: |
+          cp packaging/linux/install.sh packaging/linux/uninstall.sh packaging/linux/shalost-fotur.desktop dist/Shalost-FOTUR/
+          chmod +x dist/Shalost-FOTUR/install.sh dist/Shalost-FOTUR/uninstall.sh
+          mkdir -p releases
+          tar -czf releases/Shalost-FOTUR-linux-x86_64.tar.gz -C dist Shalost-FOTUR
+      - name: Build AppImage
+        run: |
+          curl -sSL -o appimagetool.AppImage https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool.AppImage
+          APPIMAGETOOL="$PWD/appimagetool.AppImage --appimage-extract-and-run" packaging/linux/build-appimage.sh
+      - name: Upload release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: Shalost-FOTUR-Linux
+          path: |
+            releases/Shalost-FOTUR-linux-x86_64.tar.gz
+            releases/Shalost-FOTUR-x86_64.AppImage
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            releases/Shalost-FOTUR-linux-x86_64.tar.gz
+            releases/Shalost-FOTUR-x86_64.AppImage

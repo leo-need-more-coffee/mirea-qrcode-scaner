@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Shalost FOTUR
+GenericName=Pulse attendance helper
+Comment=Подтверждение присутствия в Pulse РТУ МИРЭА
+Exec=APP_EXEC
+Icon=shalost-fotur
+Terminal=false
+Categories=Utility;Education;
+StartupWMClass=Shalost-FOTUR

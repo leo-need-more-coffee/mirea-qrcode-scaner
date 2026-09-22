@@ -1,4 +1,4 @@
-"""Нативное приложение Shalost FOTUR для Windows"""
+"""Нативное приложение Shalost FOTUR для Windows и Linux"""
 from __future__ import annotations
 
 import json
@@ -7,13 +7,14 @@ import os
 import queue
 import shutil
 import struct
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 import webbrowser
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import font as tkfont, messagebox, ttk
 from urllib.parse import parse_qs, unquote, unquote_plus, urlparse
 from uuid import UUID
 
@@ -24,7 +25,18 @@ APP_NAME = "Shalost FOTUR"
 PULSE_HOME = "https://pulse.mirea.ru/"
 PULSE_RPC = "https://pulse.mirea.ru/rtu_tc.attendance.api.AttendanceService/SelfApproveAttendanceThroughQRCode"
 CLOUDTIPS_URL = "https://pay.cloudtips.ru/p/b58c4bc1"
-DATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Shalost"
+
+
+def data_dir() -> Path:
+    """Папка приложения в стандартном месте текущей системы"""
+    if sys.platform == "win32":
+        return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Shalost"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Shalost"
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "Shalost"
+
+
+DATA_DIR = data_dir()
 CHROME_PROFILE = DATA_DIR / "pulse-chrome-profile"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 RUN_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -54,6 +66,24 @@ STATE_JS = """() => {
     .filter(x => x && !/настройки|settings/i.test(x));
   return {onPulse: location.hostname === 'pulse.mirea.ru', name: values.at(-1) || ''};
 }"""
+
+
+OPEN_FOLDER_TEXT = "Открыть в Проводнике" if sys.platform == "win32" else "Открыть папку"
+
+UI_FONTS = ("Segoe UI", "Inter", "Noto Sans", "Cantarell", "DejaVu Sans", "Liberation Sans")
+MONO_FONTS = ("Cascadia Mono", "JetBrains Mono", "Fira Mono", "Noto Sans Mono", "DejaVu Sans Mono", "Liberation Mono")
+
+
+def pick_font(root: tk.Misc, wanted: tuple[str, ...], fallback: str) -> str:
+    """Первый доступный шрифт: Windows берёт первый из списка, Linux — свой системный"""
+    try:
+        families = set(tkfont.families(root))
+    except tk.TclError:
+        return fallback
+    for family in wanted:
+        if family in families:
+            return family
+    return fallback
 
 
 def logger() -> logging.Logger:
@@ -120,6 +150,108 @@ def grpc_web_trailer(data: bytes) -> tuple[str | None, str]:
     return status, message
 
 
+SCREEN_CAPTURE = None
+
+
+def wayland_session() -> bool:
+    """Сеанс Wayland: снимок всех экранов и автоклик через X11 там недоступны"""
+    return sys.platform == "linux" and (os.environ.get("XDG_SESSION_TYPE") == "wayland" or bool(os.environ.get("WAYLAND_DISPLAY")))
+
+
+def grab_screens():
+    """Скриншот всех экранов и начало координат виртуального рабочего стола
+
+    Windows отдаёт объединённый снимок через ImageGrab, Linux — через mss,
+    потому что all_screens в Pillow поддерживается только на Windows.
+    """
+    global SCREEN_CAPTURE
+    if sys.platform == "win32":
+        from PIL import ImageGrab
+        import ctypes
+        user32 = ctypes.windll.user32
+        # Начало виртуального стола может быть отрицательным при мониторе слева
+        return ImageGrab.grab(all_screens=True), user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
+    if sys.platform == "darwin":
+        from PIL import ImageGrab
+        return ImageGrab.grab(), 0, 0
+    import mss
+    from PIL import Image
+    if SCREEN_CAPTURE is None:
+        SCREEN_CAPTURE = mss.mss()
+    area = SCREEN_CAPTURE.monitors[0]
+    shot = SCREEN_CAPTURE.grab(area)
+    image = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+    return image, area["left"], area["top"]
+
+
+def click_x11(x: int, y: int) -> bool:
+    """Клик левой кнопкой через XTEST: работает в сеансе X11 и в XWayland"""
+    import ctypes
+    import ctypes.util
+    try:
+        x11 = ctypes.CDLL(ctypes.util.find_library("X11") or "libX11.so.6")
+        xtst = ctypes.CDLL(ctypes.util.find_library("Xtst") or "libXtst.so.6")
+    except OSError:
+        return False
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XFlush.argtypes = [ctypes.c_void_p]
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    xtst.XTestFakeMotionEvent.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_ulong]
+    xtst.XTestFakeButtonEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_ulong]
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return False
+    try:
+        xtst.XTestFakeMotionEvent(display, -1, x, y, 0)
+        xtst.XTestFakeButtonEvent(display, 1, 1, 0)
+        xtst.XTestFakeButtonEvent(display, 1, 0, 10)
+        x11.XFlush(display)
+    finally:
+        x11.XCloseDisplay(display)
+    return True
+
+
+def click_xdotool(x: int, y: int) -> bool:
+    """Запасной вариант клика, если библиотеки XTEST нет в системе"""
+    try:
+        subprocess.run(["xdotool", "mousemove", str(x), str(y), "click", "1"], check=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def system_browser() -> str | None:
+    """Путь к установленному в системе Chrome или Chromium"""
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def launch_context(playwright, headless: bool):
+    """Открывает профиль Pulse: сначала официальный Chrome, затем браузер системы
+
+    На Windows подходит канал chrome, в Linux Chrome часто установлен как chromium,
+    поэтому запасным вариантом идёт найденный в PATH браузер.
+    """
+    attempts: list[dict] = [{"channel": "chrome"}]
+    executable = system_browser()
+    if executable:
+        attempts.append({"executable_path": executable})
+    attempts.append({"channel": "chromium"})
+    failure = None
+    for options in attempts:
+        try:
+            context = playwright.chromium.launch_persistent_context(str(CHROME_PROFILE), headless=headless, **options)
+            LOGGER.info("Browser started with %s", options)
+            return context
+        except PlaywrightError as exc:
+            failure = exc
+    raise failure
+
+
 class App:
     BG, CARD, FIELD = "#0f1929", "#192841", "#0a1424"
     TEXT, MUTED, BLUE, SECONDARY, RED = "#f4f7ff", "#9fc5ff", "#397cff", "#29466f", "#ca435b"
@@ -139,8 +271,9 @@ class App:
         self.root.geometry("760x670")
         self.root.minsize(680, 670)
         self.root.configure(bg=self.BG)
-        if APP_ICON.exists():
-            self.root.iconbitmap(default=str(APP_ICON))
+        self.font = pick_font(self.root, UI_FONTS, "TkDefaultFont")
+        self.mono = pick_font(self.root, MONO_FONTS, "TkFixedFont")
+        self.set_icon()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.styles()
         self.build()
@@ -150,10 +283,21 @@ class App:
         self.root.after(150, self.pump)
         self.root.after(1000, self.check_session)
 
+    def set_icon(self) -> None:
+        """Windows берёт значок из ICO, остальные системы — из PNG"""
+        try:
+            if sys.platform == "win32" and APP_ICON.exists():
+                self.root.iconbitmap(default=str(APP_ICON))
+            elif APP_ICON_PNG.exists():
+                self.window_icon = tk.PhotoImage(file=str(APP_ICON_PNG))
+                self.root.iconphoto(True, self.window_icon)
+        except tk.TclError:
+            LOGGER.exception("Application icon cannot be loaded")
+
     def styles(self) -> None:
         style = ttk.Style(self.root)
         style.theme_use("clam")
-        style.configure("TButton", font=("Segoe UI", 10, "bold"), padding=(12, 8), background=self.BLUE, foreground="white", borderwidth=0)
+        style.configure("TButton", font=(self.font, 10, "bold"), padding=(12, 8), background=self.BLUE, foreground="white", borderwidth=0)
         style.map("TButton", background=[("active", "#5b92ff")])
         style.configure("Secondary.TButton", background=self.SECONDARY)
         style.configure("Danger.TButton", background=self.RED)
@@ -171,7 +315,7 @@ class App:
             pass
 
     def label(self, parent, text, size=10, bold=False, color=None, **kwargs):
-        return tk.Label(parent, text=text, bg=self.CARD, fg=color or self.TEXT, font=("Segoe UI", size, "bold" if bold else "normal"), **kwargs)
+        return tk.Label(parent, text=text, bg=self.CARD, fg=color or self.TEXT, font=(self.font, size, "bold" if bold else "normal"), **kwargs)
 
     def card(self, parent):
         return self.round_widget(tk.Frame(parent, bg=self.CARD, highlightbackground="#2d4971", highlightthickness=1, padx=14, pady=12), 12)
@@ -202,7 +346,7 @@ class App:
     def build(self) -> None:
         outer = tk.Frame(self.root, bg=self.BG, padx=20, pady=18)
         outer.pack(fill="both", expand=True)
-        tk.Label(outer, text=APP_NAME, bg=self.BG, fg=self.TEXT, font=("Segoe UI", 22, "bold")).pack(anchor="w")
+        tk.Label(outer, text=APP_NAME, bg=self.BG, fg=self.TEXT, font=(self.font, 22, "bold")).pack(anchor="w")
         nav = tk.Frame(outer, bg=self.BG, pady=12)
         nav.pack(fill="x")
         self.button(nav, text="Главная", command=self.show_main).pack(side="left")
@@ -214,14 +358,14 @@ class App:
         self.build_settings()
         footer = tk.Frame(outer, bg=self.BG)
         footer.pack(fill="x", pady=(8, 0))
-        tk.Label(footer, text="Сделано ", bg=self.BG, fg="#9db1ce", font=("Segoe UI", 9)).pack(side="left")
+        tk.Label(footer, text="Сделано ", bg=self.BG, fg="#9db1ce", font=(self.font, 9)).pack(side="left")
         self.link(footer, "FOTUR", "https://fotur.tech").pack(side="left")
-        tk.Label(footer, text=" для студентов by ", bg=self.BG, fg="#9db1ce", font=("Segoe UI", 9)).pack(side="left")
+        tk.Label(footer, text=" для студентов by ", bg=self.BG, fg="#9db1ce", font=(self.font, 9)).pack(side="left")
         self.link(footer, "@Woonze", "https://github.com/Woonze").pack(side="left")
         self.show_main()
 
     def link(self, parent, text, url):
-        item = tk.Label(parent, text=text, bg=parent.cget("bg"), fg="#77adff", cursor="hand2", font=("Segoe UI", 9, "underline"))
+        item = tk.Label(parent, text=text, bg=parent.cget("bg"), fg="#77adff", cursor="hand2", font=(self.font, 9, "underline"))
         item.bind("<Button-1>", lambda _event: webbrowser.open(url))
         return item
 
@@ -243,7 +387,7 @@ class App:
         logs.pack(fill="both", expand=True)
         self.label(logs, "Журнал работы", 11, True).pack(anchor="w")
         self.label(logs, f"Файл: {LOG_PATH}", 9, color=self.MUTED).pack(anchor="w", pady=(4, 8))
-        self.console = tk.Text(logs, height=12, bg=self.FIELD, fg="#dcebff", insertbackground="white", relief="flat", wrap="word", font=("Cascadia Mono", 9), padx=10, pady=8)
+        self.console = tk.Text(logs, height=12, bg=self.FIELD, fg="#dcebff", insertbackground="white", relief="flat", wrap="word", font=(self.mono, 9), padx=10, pady=8)
         self.console.pack(fill="both", expand=True)
         self.console.configure(state="disabled")
 
@@ -279,7 +423,7 @@ class App:
                 qr = tk.Label(support_row, image=self.donation_qr, bg=self.CARD, cursor="hand2")
                 qr.pack(side="right", padx=(10, 0))
                 qr.bind("<Button-1>", lambda _event: webbrowser.open(CLOUDTIPS_URL))
-            except tk.TclError:
+            except (tk.TclError, ImportError):
                 LOGGER.exception("Donation QR cannot be loaded")
         profile = self.card(self.settings_page)
         profile.pack(fill="x")
@@ -289,8 +433,22 @@ class App:
         buttons = tk.Frame(profile, bg=self.CARD)
         buttons.pack(anchor="w", pady=(8, 0))
         self.button(buttons, text="Копировать путь", command=self.copy_profile).pack(side="left")
-        self.button(buttons, text="Открыть в Проводнике", style="Secondary.TButton", command=lambda: os.startfile(CHROME_PROFILE)).pack(side="left", padx=8)
+        self.button(buttons, text=OPEN_FOLDER_TEXT, style="Secondary.TButton", command=self.open_profile).pack(side="left", padx=8)
         self.button(buttons, text="Выйти", style="Danger.TButton", command=self.logout).pack(side="left")
+
+    def open_profile(self) -> None:
+        """Открывает папку профиля системным файловым менеджером"""
+        try:
+            CHROME_PROFILE.mkdir(parents=True, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(CHROME_PROFILE)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(CHROME_PROFILE)])
+            else:
+                subprocess.Popen(["xdg-open", str(CHROME_PROFILE)])
+        except (OSError, subprocess.SubprocessError) as exc:
+            LOGGER.exception("Profile folder cannot be opened")
+            self.log("UI", "Не удалось открыть папку профиля: " + self.short(exc))
 
     def show_main(self) -> None:
         self.settings_page.pack_forget()
@@ -370,7 +528,7 @@ class App:
     def check_worker(self) -> None:
         try:
             with sync_playwright() as p:
-                ctx = p.chromium.launch_persistent_context(str(CHROME_PROFILE), channel="chrome", headless=True)
+                ctx = launch_context(p, headless=True)
                 name, logged = self.state(ctx.pages[0] if ctx.pages else ctx.new_page())
                 ctx.close()
             if logged:
@@ -401,7 +559,7 @@ class App:
     def login_worker(self) -> None:
         try:
             with sync_playwright() as p:
-                ctx = p.chromium.launch_persistent_context(str(CHROME_PROFILE), channel="chrome", headless=False)
+                ctx = launch_context(p, headless=False)
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 page.goto(PULSE_HOME, wait_until="domcontentloaded", timeout=60000)
                 for _ in range(600):
@@ -448,23 +606,24 @@ class App:
 
     def scan_worker(self) -> None:
         try:
-            from PIL import ImageGrab
             import zxingcpp
         except Exception as exc:
             self.log("SCAN", "Не удалось загрузить модуль сканирования: " + self.short(exc))
             self.scanning = False
             self.post("scan", False)
             return
+        if wayland_session():
+            self.log("SCAN", "Сеанс Wayland: снимок экрана и автоклик работают только в сеансе X11")
         confirmed_tokens: set[str] = set()
         qr_successes = 0
         presence_pending = False
         while self.scanning and not self.stop.is_set():
             try:
-                screenshot = ImageGrab.grab(all_screens=True)
+                screenshot, origin_x, origin_y = grab_screens()
                 presence_button = self.find_presence_button(screenshot)
                 presence_activity = bool(presence_button)
                 if presence_button:
-                    self.click_screen_point(*presence_button)
+                    self.click_screen_point(presence_button[0] + origin_x, presence_button[1] + origin_y)
                     presence_pending = True
                     self.post("status", "Подтверждаю присутствие в MTS Link…")
                 elif presence_pending:
@@ -566,27 +725,28 @@ class App:
                     return center_x, y + 18
         return None
 
-    @staticmethod
-    def click_screen_point(x: int, y: int) -> None:
-        if sys.platform != "win32":
+    def click_screen_point(self, x: int, y: int) -> None:
+        """Клик по точке виртуального рабочего стола"""
+        if sys.platform == "win32":
+            import ctypes
+            user32 = ctypes.windll.user32
+            user32.SetCursorPos(x, y)
+            user32.mouse_event(0x0002, 0, 0, 0, 0)  # Нажатие левой кнопки
+            user32.mouse_event(0x0004, 0, 0, 0, 0)  # Отпускание левой кнопки
             return
-        import ctypes
-        # PIL возвращает координаты внутри объединённого скриншота
-        # Координаты мыши Windows отсчитываются от начала виртуального рабочего стола
-        # При мониторе слева начало виртуального стола может быть отрицательным
-        user32 = ctypes.windll.user32
-        x += user32.GetSystemMetrics(76)  # Координата X виртуального стола
-        y += user32.GetSystemMetrics(77)  # Координата Y виртуального стола
-        user32.SetCursorPos(x, y)
-        user32.mouse_event(0x0002, 0, 0, 0, 0)  # Нажатие левой кнопки
-        user32.mouse_event(0x0004, 0, 0, 0, 0)  # Отпускание левой кнопки
+        if sys.platform == "linux":
+            if click_x11(x, y) or click_xdotool(x, y):
+                return
+            self.log("PRESENCE", "Автоклик недоступен: нужен сеанс X11 или XWayland либо пакет xdotool")
+            return
+        self.log("PRESENCE", "Автоклик поддерживается только в Windows и Linux")
 
     def approve(self, token: str) -> tuple[bool, str]:
         if self.browser_busy:
             return False, "завершите вход в Pulse"
         try:
             with sync_playwright() as p:
-                ctx = p.chromium.launch_persistent_context(str(CHROME_PROFILE), channel="chrome", headless=True)
+                ctx = launch_context(p, headless=True)
                 page = ctx.pages[0] if ctx.pages else ctx.new_page()
                 page.goto(PULSE_HOME, wait_until="domcontentloaded", timeout=60000)
                 result = page.evaluate("""async ({url, body}) => {
